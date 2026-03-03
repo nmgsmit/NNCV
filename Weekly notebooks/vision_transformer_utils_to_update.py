@@ -109,21 +109,31 @@ class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        head_dim = dim // num_heads # Number of heads in multi-headed attention
+        self.scale = qk_scale or head_dim ** -0.5 #sqrt(Dk)
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias) # single linear layer that projects input into QKV
+        self.attn_drop = nn.Dropout(attn_drop) # dropout rate for attentin weights
+        self.proj = nn.Linear(dim, dim) # final projection layer
+        self.proj_drop = nn.Dropout(proj_drop) #dropout rate for output of final projection layer
 
     def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        B, N, C = x.shape # extract from input: B= atch size, N tokens/patches, C= Channel/Embedding dimension
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4) #get qkv matrix dependent on num heads, batch size, patches, embedding dimension 
 
-        #TODO: complete the forward pass
-        # q, k, v = 
-        
+        q, k, v = qkv
+        kT = k.transpose(-2,-1)
+        attn = ((q @ kT)*self.scale) #MatMul, Scale
+
+        attn = attn.softmax(dim=-1) # Softmax
+        attn = self.attn_drop(attn) #regularization dropout
+
+        x = (attn @ v) #matmul
+        x = x.transpose(1,2) # Put heads and sequence in normal position
+        x = x.reshape(B, N, C) # concatenate information of all attention heads
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
         return x, attn
 
 
@@ -203,8 +213,7 @@ class PatchEmbed(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         
-        # TODO: Complete the forward pass
-        # x =
+        x = self.proj(x).flatten(2).transpose(1, 2)
 
         return x
 
