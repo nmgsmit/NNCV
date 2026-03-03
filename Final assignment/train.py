@@ -91,26 +91,40 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Define the transforms to apply to the data
-    transform = Compose([
+    # Image transform: convert to tensor, resize, normalize
+    image_transform = Compose([
         ToImage(),
         Resize((256, 256)),
         ToDtype(torch.float32, scale=True),
         Normalize((0.5,), (0.5,)),
     ])
     
+    # Label transform: convert to tensor, resize, but NO normalization (keep as integers)
+    label_transform = Compose([
+        Resize((256, 256)),
+        ToImage(),
+        ToDtype(torch.int64),  # Convert to tensor as int64, NO scaling or normalization
+    ])
+    
+    # Custom transform function to apply different transforms to image and label
+    def transforms_fn(image, label):
+        image = image_transform(image)
+        label = label_transform(label)
+        return image, label
+    
     train_dataset = Cityscapes(
         args.data_dir, 
         split="train", 
         mode="fine", 
         target_type="semantic", 
-        transforms=transform
+        transforms=transforms_fn
     )
     valid_dataset = Cityscapes(
         args.data_dir, 
         split="val", 
         mode="fine", 
         target_type="semantic", 
-        transforms=transform
+        transforms=transforms_fn
     )
 
     train_dataloader = DataLoader(
