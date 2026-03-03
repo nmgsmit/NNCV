@@ -91,27 +91,39 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Define the transforms to apply to the data
-    transform = Compose([
+    # Transforms for images only
+    image_transform = Compose([
         ToImage(),
         Resize((256, 256)),
         ToDtype(torch.float32, scale=True),
         Normalize((0.5,), (0.5,)),
     ])
+    
+    # Transforms for labels only (resize but keep as integers)
+    label_transform = Compose([
+        Resize((256, 256)),
+    ])
 
     # Load the dataset and make a split for training and validation
+    def transform_fn(image, label):
+        """Apply image transform and label transform separately"""
+        image = image_transform(image)
+        label = label_transform(label)
+        return image, label
+    
     train_dataset = Cityscapes(
         args.data_dir, 
         split="train", 
         mode="fine", 
         target_type="semantic", 
-        transforms=transform
+        transforms=transform_fn
     )
     valid_dataset = Cityscapes(
         args.data_dir, 
         split="val", 
         mode="fine", 
         target_type="semantic", 
-        transforms=transform
+        transforms=transform_fn
     )
 
     train_dataloader = DataLoader(
