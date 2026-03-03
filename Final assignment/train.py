@@ -102,6 +102,8 @@ def main(args):
     # Transforms for labels only (resize but keep as integers)
     label_transform = Compose([
         Resize((256, 256)),
+        ToImage(),
+        ToDtype(torch.int64),  # Convert to tensor as int64, no scaling
     ])
 
     # Load the dataset and make a split for training and validation
