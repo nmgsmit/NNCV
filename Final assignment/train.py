@@ -28,6 +28,7 @@ from torchvision.transforms.v2 import (
     Resize,
     ToImage,
     ToDtype,
+    InterpolationMode
 )
 
 from model import Model
@@ -91,40 +92,37 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Define the transforms to apply to the data
-    # Image transform: convert to tensor, resize, normalize
-    image_transform = Compose([
-        ToImage(),
-        Resize((256, 256)),
-        ToDtype(torch.float32, scale=True),
-        Normalize((0.5,), (0.5,)),
+    img_transform = Compose([
+    ToImage(),
+    Resize((256, 256)),
+    ToDtype(torch.float32, scale=True),
+    Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
-    
-    # Label transform: convert to tensor, resize, but NO normalization (keep as integers)
-    label_transform = Compose([
-        Resize((256, 256)),
+
+    # Target transform (mask)
+    target_transform = Compose([
         ToImage(),
-        ToDtype(torch.int64),  # Convert to tensor as int64, NO scaling or normalization
+        Resize((256, 256), interpolation=InterpolationMode.NEAREST),
+        ToDtype(torch.int64),  # no scaling
     ])
-    
-    # Custom transform function to apply different transforms to image and label
-    def transforms_fn(image, label):
-        image = image_transform(image)
-        label = label_transform(label)
-        return image, label
-    
+
+    # Load the dataset and make a split for training and validation
     train_dataset = Cityscapes(
-        args.data_dir, 
-        split="train", 
-        mode="fine", 
-        target_type="semantic", 
-        transforms=transforms_fn
+    args.data_dir,
+    split="train",
+    mode="fine",
+    target_type="semantic",
+    transform=img_transform,
+    target_transform=target_transform,
     )
+
     valid_dataset = Cityscapes(
-        args.data_dir, 
-        split="val", 
-        mode="fine", 
-        target_type="semantic", 
-        transforms=transforms_fn
+        args.data_dir,
+        split="val",
+        mode="fine",
+        target_type="semantic",
+        transform=img_transform,
+        target_transform=target_transform,
     )
 
     train_dataloader = DataLoader(
