@@ -2,3 +2,7 @@ data/
 *.sif
 *.out
 .env
+local_data/
+local_output/
+*.pt
+img/
