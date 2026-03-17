@@ -137,7 +137,7 @@ def get_args_parser():
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Weight for dice loss")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
+    parser.add_argument("--experiment-id", type=str, default="efficient DDRNET-23-slim", help="Experiment ID for Weights & Biases")
 
     return parser
 
@@ -237,7 +237,7 @@ def main(args):
 
     # Training loop
     best_valid_loss = float('inf')
-    current_best_model_path = None
+    best_model_path = os.path.join(output_dir, "best_model.pt")
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1:04}/{args.epochs:04}")
 
@@ -325,13 +325,7 @@ def main(args):
 
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
-                if current_best_model_path:
-                    os.remove(current_best_model_path)
-                current_best_model_path = os.path.join(
-                    output_dir, 
-                    f"best_model-epoch={epoch:04}-val_loss={valid_loss:04}.pt"
-                )
-                torch.save(model.state_dict(), current_best_model_path)
+                torch.save(model.state_dict(), best_model_path)
         
     print("Training complete!")
 
