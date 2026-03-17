@@ -56,6 +56,34 @@ def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
     return color_image
 
 
+def update_dice_stats(
+    intersection: torch.Tensor,
+    denominator: torch.Tensor,
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    n_classes: int,
+    ignore_index: int = 255,
+):
+    for cls in range(n_classes):
+        pred_mask = pred == cls
+        target_mask = target == cls
+        valid_mask = target != ignore_index
+
+        pred_mask = pred_mask & valid_mask
+        target_mask = target_mask & valid_mask
+
+        intersection[cls] += (pred_mask & target_mask).sum().item()
+        denominator[cls] += pred_mask.sum().item() + target_mask.sum().item()
+
+
+def compute_mean_dice(intersection: torch.Tensor, denominator: torch.Tensor, eps: float = 1e-6):
+    valid = denominator > 0
+    if valid.sum().item() == 0:
+        return 0.0
+    dice = (2.0 * intersection[valid] + eps) / (denominator[valid] + eps)
+    return dice.mean().item()
+
+
 def get_args_parser():
 
     parser = ArgumentParser("Training script for a PyTorch U-Net model")
@@ -181,6 +209,8 @@ def main(args):
         model.eval()
         with torch.no_grad():
             losses = []
+            dice_intersection = torch.zeros(19, dtype=torch.float64)
+            dice_denominator = torch.zeros(19, dtype=torch.float64)
             for i, (images, labels) in enumerate(valid_dataloader):
 
                 labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
@@ -191,10 +221,18 @@ def main(args):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
                 losses.append(loss.item())
+
+                predictions = outputs.softmax(1).argmax(1)
+                update_dice_stats(
+                    intersection=dice_intersection,
+                    denominator=dice_denominator,
+                    pred=predictions,
+                    target=labels,
+                    n_classes=19,
+                    ignore_index=255,
+                )
             
                 if i == 0:
-                    predictions = outputs.softmax(1).argmax(1)
-
                     predictions = predictions.unsqueeze(1)
                     labels = labels.unsqueeze(1)
 
@@ -213,8 +251,10 @@ def main(args):
                     }, step=(epoch + 1) * len(train_dataloader) - 1)
             
             valid_loss = sum(losses) / len(losses)
+            valid_mean_dice = compute_mean_dice(dice_intersection, dice_denominator)
             wandb.log({
-                "valid_loss": valid_loss
+                "valid_loss": valid_loss,
+                "valid_mean_dice": valid_mean_dice,
             }, step=(epoch + 1) * len(train_dataloader) - 1)
 
             if valid_loss < best_valid_loss:
