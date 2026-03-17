@@ -18,7 +18,7 @@ from argparse import ArgumentParser
 import wandb
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
+from torch.optim import SGD
 from torch.utils.data import DataLoader
 from torchvision.datasets import Cityscapes
 from torchvision.utils import make_grid
@@ -56,13 +56,85 @@ def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
     return color_image
 
 
+class OHEMCrossEntropyLoss(nn.Module):
+    def __init__(self, ignore_index=255, thresh=0.7, min_kept=131072):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.thresh = thresh
+        self.min_kept = min_kept
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pixel_losses = nn.functional.cross_entropy(
+            logits,
+            target,
+            ignore_index=self.ignore_index,
+            reduction="none",
+        )
+
+        valid_mask = target != self.ignore_index
+        valid_losses = pixel_losses[valid_mask]
+        if valid_losses.numel() == 0:
+            return pixel_losses.mean()
+
+        with torch.no_grad():
+            sorted_losses, _ = torch.sort(valid_losses, descending=True)
+            if sorted_losses.numel() > self.min_kept:
+                dynamic_thresh = sorted_losses[self.min_kept - 1]
+                threshold = max(dynamic_thresh.item(), self.thresh)
+            else:
+                threshold = self.thresh
+
+        hard_losses = valid_losses[valid_losses >= threshold]
+        if hard_losses.numel() == 0:
+            hard_losses = valid_losses
+        return hard_losses.mean()
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, ignore_index=255, eps=1e-6):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.eps = eps
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        n_classes = logits.shape[1]
+        probs = torch.softmax(logits, dim=1)
+
+        valid_mask = target != self.ignore_index
+        target_safe = target.clone()
+        target_safe[~valid_mask] = 0
+
+        target_one_hot = nn.functional.one_hot(target_safe, num_classes=n_classes).permute(0, 3, 1, 2).float()
+        valid_mask = valid_mask.unsqueeze(1).float()
+
+        probs = probs * valid_mask
+        target_one_hot = target_one_hot * valid_mask
+
+        intersection = (probs * target_one_hot).sum(dim=(0, 2, 3))
+        denominator = probs.sum(dim=(0, 2, 3)) + target_one_hot.sum(dim=(0, 2, 3))
+
+        dice = (2.0 * intersection + self.eps) / (denominator + self.eps)
+        return 1.0 - dice.mean()
+
+
+def poly_lr(base_lr: float, current_iter: int, max_iter: int, power: float = 0.9) -> float:
+    return base_lr * ((1.0 - float(current_iter) / max_iter) ** power)
+
+
 def get_args_parser():
 
     parser = ArgumentParser("Training script for a PyTorch U-Net model")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
-    parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=16, help="Training batch size")
+    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=1e-2, help="Initial learning rate for poly decay")
+    parser.add_argument("--momentum", type=float, default=0.9, help="Momentum for SGD")
+    parser.add_argument("--weight-decay", type=float, default=5e-4, help="Weight decay")
+    parser.add_argument("--poly-power", type=float, default=0.9, help="Power for poly learning rate schedule")
+    parser.add_argument("--ohem-thresh", type=float, default=0.7, help="OHEM threshold")
+    parser.add_argument("--ohem-min-kept", type=int, default=131072, help="Minimum hard pixels for OHEM")
+    parser.add_argument("--aux-weight", type=float, default=0.4, help="Weight for auxiliary OHEM loss")
+    parser.add_argument("--dice-weight", type=float, default=1.0, help="Weight for dice loss")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
@@ -145,10 +217,23 @@ def main(args):
     ).to(device)
 
     # Define the loss function
-    criterion = nn.CrossEntropyLoss(ignore_index=255)  # Ignore the void class
+    ohem_criterion = OHEMCrossEntropyLoss(
+        ignore_index=255,
+        thresh=args.ohem_thresh,
+        min_kept=args.ohem_min_kept,
+    )
+    dice_criterion = DiceLoss(ignore_index=255)
 
     # Define the optimizer
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+    optimizer = SGD(
+        model.parameters(),
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+    )
+
+    max_iter = args.epochs * len(train_dataloader)
+    global_iter = 0
 
     # Training loop
     best_valid_loss = float('inf')
@@ -165,17 +250,35 @@ def main(args):
 
             labels = labels.long().squeeze(1)  # Remove channel dimension
 
+            current_lr = poly_lr(args.lr, global_iter, max_iter, args.poly_power)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = current_lr
+
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, labels)
+
+            if isinstance(outputs, tuple):
+                main_logits, aux_logits = outputs
+            else:
+                main_logits, aux_logits = outputs, None
+
+            loss_main = ohem_criterion(main_logits, labels)
+            loss_aux = ohem_criterion(aux_logits, labels) if aux_logits is not None else torch.tensor(0.0, device=device)
+            loss_dice = dice_criterion(main_logits, labels)
+            loss = loss_main + args.aux_weight * loss_aux + args.dice_weight * loss_dice
+
             loss.backward()
             optimizer.step()
 
             wandb.log({
                 "train_loss": loss.item(),
+                "train_loss_main_ohem": loss_main.item(),
+                "train_loss_aux_ohem": loss_aux.item() if aux_logits is not None else 0.0,
+                "train_loss_dice": loss_dice.item(),
                 "learning_rate": optimizer.param_groups[0]['lr'],
                 "epoch": epoch + 1,
             }, step=epoch * len(train_dataloader) + i)
+            global_iter += 1
             
         # Validation
         model.eval()
@@ -189,7 +292,10 @@ def main(args):
                 labels = labels.long().squeeze(1)  # Remove channel dimension
 
                 outputs = model(images)
-                loss = criterion(outputs, labels)
+                if isinstance(outputs, tuple):
+                    outputs = outputs[0]
+
+                loss = ohem_criterion(outputs, labels)
                 losses.append(loss.item())
             
                 if i == 0:
