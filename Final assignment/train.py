@@ -13,13 +13,14 @@ allowing you to easily modify hyperparameters using a command-line argument pars
 Feel free to customize the script as needed for your use case.
 """
 import os
+import copy
 from argparse import ArgumentParser
 
 import wandb
 import torch
 import torch.nn as nn
 from torch.optim import SGD
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import Cityscapes
 from torchvision.utils import make_grid
 from torchvision.transforms.v2 import (
@@ -54,6 +55,24 @@ def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
             color_image[:, i][mask] = color[i]
 
     return color_image
+
+
+class AugmentedCityscapes(Dataset):
+    """Apply lightweight joint augmentations to image/mask pairs."""
+
+    def __init__(self, base_dataset: Dataset, hflip_prob: float = 0.0):
+        self.base_dataset = base_dataset
+        self.hflip_prob = hflip_prob
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, index):
+        image, target = self.base_dataset[index]
+        if self.hflip_prob > 0.0 and torch.rand(1).item() < self.hflip_prob:
+            image = torch.flip(image, dims=[2])
+            target = torch.flip(target, dims=[2])
+        return image, target
 
 
 class OHEMCrossEntropyLoss(nn.Module):
@@ -126,6 +145,18 @@ def poly_lr(base_lr: float, current_iter: int, max_iter: int, power: float = 0.9
     return base_lr * ((1.0 - float(current_iter) / max_iter) ** power)
 
 
+def update_ema_model(ema_model: nn.Module, model: nn.Module, decay: float):
+    with torch.no_grad():
+        model_state = dict(model.named_parameters())
+        for name, ema_param in ema_model.named_parameters():
+            model_param = model_state[name]
+            ema_param.mul_(decay).add_(model_param, alpha=1.0 - decay)
+
+        model_buffers = dict(model.named_buffers())
+        for name, ema_buffer in ema_model.named_buffers():
+            ema_buffer.copy_(model_buffers[name])
+
+
 def get_args_parser():
 
     parser = ArgumentParser("Training script for a PyTorch U-Net model")
@@ -143,6 +174,8 @@ def get_args_parser():
     parser.add_argument("--label-smoothing", type=float, default=0.05, help="Label smoothing for OHEM cross-entropy")
     parser.add_argument("--early-stop-patience", type=int, default=6, help="Number of epochs without validation improvement before stopping")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
+    parser.add_argument("--hflip-prob", type=float, default=0.5, help="Horizontal flip probability for training augmentation")
+    parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for evaluation model (<=0 disables EMA)")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="efficient DDRNET-23-slim", help="Experiment ID for Weights & Biases")
@@ -187,7 +220,7 @@ def main(args):
     ])
 
     # Load the dataset and make a split for training and validation
-    train_dataset = Cityscapes(
+    train_base_dataset = Cityscapes(
     args.data_dir,
     split="train",
     mode="fine",
@@ -195,6 +228,7 @@ def main(args):
     transform=img_transform,
     target_transform=target_transform,
     )
+    train_dataset = AugmentedCityscapes(train_base_dataset, hflip_prob=args.hflip_prob)
 
     valid_dataset = Cityscapes(
         args.data_dir,
@@ -223,6 +257,12 @@ def main(args):
         in_channels=3,  # RGB images
         n_classes=19,  # 19 classes in the Cityscapes dataset
     ).to(device)
+    ema_model = None
+    if args.ema_decay > 0.0:
+        ema_model = copy.deepcopy(model).to(device)
+        ema_model.eval()
+        for p in ema_model.parameters():
+            p.requires_grad = False
 
     # Define the loss function
     ohem_criterion = OHEMCrossEntropyLoss(
@@ -283,6 +323,8 @@ def main(args):
 
             loss.backward()
             optimizer.step()
+            if ema_model is not None:
+                update_ema_model(ema_model, model, args.ema_decay)
 
             wandb.log({
                 "train_loss": loss.item(),
@@ -293,6 +335,8 @@ def main(args):
             
         # Validation
         model.eval()
+        eval_model = ema_model if ema_model is not None else model
+        eval_model.eval()
         with torch.no_grad():
             valid_losses_total = []
             valid_dice_scores = []
@@ -303,7 +347,7 @@ def main(args):
 
                 labels = labels.long().squeeze(1)  # Remove channel dimension
 
-                outputs = model(images)
+                outputs = eval_model(images)
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
 
@@ -343,7 +387,10 @@ def main(args):
             if valid_mean_dice > best_dice + args.early_stop_min_delta:
                 best_dice = valid_mean_dice
                 best_valid_loss = valid_loss
-                torch.save(model.state_dict(), best_model_path)
+                if ema_model is not None:
+                    torch.save(ema_model.state_dict(), best_model_path)
+                else:
+                    torch.save(model.state_dict(), best_model_path)
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
