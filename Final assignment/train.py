@@ -173,7 +173,7 @@ def main(args):
     ToImage(),
     Resize((256, 256)),
     ToDtype(torch.float32, scale=True),
-    Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
 
     # Target transform (mask)
