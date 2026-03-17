@@ -57,17 +57,19 @@ def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
 
 
 class OHEMCrossEntropyLoss(nn.Module):
-    def __init__(self, ignore_index=255, thresh=0.7, min_kept=131072):
+    def __init__(self, ignore_index=255, thresh=0.7, min_kept=131072, label_smoothing=0.0):
         super().__init__()
         self.ignore_index = ignore_index
         self.thresh = thresh
         self.min_kept = min_kept
+        self.label_smoothing = label_smoothing
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         pixel_losses = nn.functional.cross_entropy(
             logits,
             target,
             ignore_index=self.ignore_index,
+            label_smoothing=self.label_smoothing,
             reduction="none",
         )
 
@@ -135,6 +137,9 @@ def get_args_parser():
     parser.add_argument("--ohem-min-kept", type=int, default=131072, help="Minimum hard pixels for OHEM")
     parser.add_argument("--aux-weight", type=float, default=0.4, help="Weight for auxiliary OHEM loss")
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Weight for dice loss")
+    parser.add_argument("--label-smoothing", type=float, default=0.05, help="Label smoothing for OHEM cross-entropy")
+    parser.add_argument("--early-stop-patience", type=int, default=6, help="Number of epochs without validation improvement before stopping")
+    parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="efficient DDRNET-23-slim", help="Experiment ID for Weights & Biases")
@@ -221,6 +226,7 @@ def main(args):
         ignore_index=255,
         thresh=args.ohem_thresh,
         min_kept=args.ohem_min_kept,
+        label_smoothing=args.label_smoothing,
     )
     dice_criterion = DiceLoss(ignore_index=255)
 
@@ -237,12 +243,16 @@ def main(args):
 
     # Training loop
     best_valid_loss = float('inf')
+    epochs_without_improvement = 0
     best_model_path = os.path.join(output_dir, "best_model.pt")
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1:04}/{args.epochs:04}")
 
         # Training
         model.train()
+        train_losses_total = []
+        train_losses_main = []
+        train_losses_dice = []
         for i, (images, labels) in enumerate(train_dataloader):
 
             labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
@@ -267,6 +277,10 @@ def main(args):
             loss_dice = dice_criterion(main_logits, labels)
             loss = loss_main + args.aux_weight * loss_aux + args.dice_weight * loss_dice
 
+            train_losses_total.append(loss.item())
+            train_losses_main.append(loss_main.item())
+            train_losses_dice.append(loss_dice.item())
+
             loss.backward()
             optimizer.step()
 
@@ -283,7 +297,9 @@ def main(args):
         # Validation
         model.eval()
         with torch.no_grad():
-            losses = []
+            valid_losses_main = []
+            valid_losses_dice = []
+            valid_losses_total = []
             for i, (images, labels) in enumerate(valid_dataloader):
 
                 labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
@@ -295,8 +311,12 @@ def main(args):
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
 
-                loss = ohem_criterion(outputs, labels)
-                losses.append(loss.item())
+                loss_main = ohem_criterion(outputs, labels)
+                loss_dice = dice_criterion(outputs, labels)
+                loss_total = loss_main + args.dice_weight * loss_dice
+                valid_losses_main.append(loss_main.item())
+                valid_losses_dice.append(loss_dice.item())
+                valid_losses_total.append(loss_total.item())
             
                 if i == 0:
                     predictions = outputs.softmax(1).argmax(1)
@@ -318,23 +338,43 @@ def main(args):
                         "labels": [wandb.Image(labels_img)],
                     }, step=(epoch + 1) * len(train_dataloader) - 1)
             
-            valid_loss = sum(losses) / len(losses)
+            train_loss_epoch = sum(train_losses_total) / len(train_losses_total)
+            train_loss_main_epoch = sum(train_losses_main) / len(train_losses_main)
+            train_loss_dice_epoch = sum(train_losses_dice) / len(train_losses_dice)
+
+            valid_loss = sum(valid_losses_total) / len(valid_losses_total)
+            valid_loss_main = sum(valid_losses_main) / len(valid_losses_main)
+            valid_loss_dice = sum(valid_losses_dice) / len(valid_losses_dice)
             wandb.log({
-                "valid_loss": valid_loss
+                "train_loss_epoch": train_loss_epoch,
+                "train_loss_main_ohem_epoch": train_loss_main_epoch,
+                "train_loss_dice_epoch": train_loss_dice_epoch,
+                "valid_loss": valid_loss,
+                "valid_loss_main_ohem": valid_loss_main,
+                "valid_loss_dice": valid_loss_dice,
             }, step=(epoch + 1) * len(train_dataloader) - 1)
 
-            if valid_loss < best_valid_loss:
+            if valid_loss < best_valid_loss - args.early_stop_min_delta:
                 best_valid_loss = valid_loss
                 torch.save(model.state_dict(), best_model_path)
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= args.early_stop_patience:
+                    print(f"Early stopping at epoch {epoch + 1}: no validation improvement for {args.early_stop_patience} epochs.")
+                    break
         
     print("Training complete!")
+
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
 
     # Save the model
     torch.save(
         model.state_dict(),
         os.path.join(
             output_dir,
-            f"final_model-epoch={epoch:04}-val_loss={valid_loss:04}.pt"
+            f"final_model-epoch={epoch:04}-best_val_loss={best_valid_loss:04}.pt"
         )
     )
     wandb.finish()

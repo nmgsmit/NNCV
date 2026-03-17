@@ -13,12 +13,15 @@ python3 train.py \
     --epochs 30 \
     --lr 1e-2 \
     --momentum 0.9 \
-    --weight-decay 5e-4 \
+    --weight-decay 1e-3 \
     --poly-power 0.9 \
     --ohem-thresh 0.7 \
     --ohem-min-kept 131072 \
     --aux-weight 0.4 \
     --dice-weight 1.0 \
+    --label-smoothing 0.05 \
+    --early-stop-patience 6 \
+    --early-stop-min-delta 1e-4 \
     --num-workers "${NUM_WORKERS}" \
     --seed 42 \
     --experiment-id "${EXPERIMENT_ID}"
