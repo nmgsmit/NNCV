@@ -66,14 +66,24 @@ class Model(nn.Module):
 		low = self.low3(self.down3(x))
 
 		high = high + F.interpolate(self.low3_to_high(low), size=high.shape[-2:], mode="bilinear", align_corners=False)
-		low = low + self.high3_to_low(high)
+		low = low + F.interpolate(
+			self.high3_to_low(high),
+			size=low.shape[-2:],
+			mode="bilinear",
+			align_corners=False,
+		)
 
 		# Stage 4 bilateral fusion.
 		high = self.high4(high)
 		low = self.low4(self.down4(low))
 
 		high = high + F.interpolate(self.low4_to_high(low), size=high.shape[-2:], mode="bilinear", align_corners=False)
-		low = low + self.high4_to_low(high)
+		low = low + F.interpolate(
+			self.high4_to_low(high),
+			size=low.shape[-2:],
+			mode="bilinear",
+			align_corners=False,
+		)
 
 		aux_logits = self.aux_head(high)
 
