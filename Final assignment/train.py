@@ -380,7 +380,7 @@ def main(args):
             valid_mean_dice = sum(valid_dice_scores) / len(valid_dice_scores)
             wandb.log({
                 "valid_loss": valid_loss,
-                "Dice": valid_mean_dice,
+                "valid_mean_dice": valid_mean_dice,
                 "epoch": epoch + 1,
             }, step=(epoch + 1) * len(train_dataloader) - 1)
 
