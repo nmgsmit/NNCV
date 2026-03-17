@@ -6,3 +6,4 @@ local_data/
 local_output/
 *.pt
 img/
+*.tar
