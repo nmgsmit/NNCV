@@ -65,6 +65,7 @@ class OHEMCrossEntropyLoss(nn.Module):
         self.label_smoothing = label_smoothing
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
         pixel_losses = nn.functional.cross_entropy(
             logits,
             target,
@@ -100,7 +101,9 @@ class DiceLoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         n_classes = logits.shape[1]
+        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
         probs = torch.softmax(logits, dim=1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
 
         valid_mask = target != self.ignore_index
         target_safe = target.clone()
@@ -127,7 +130,9 @@ class IoULoss(nn.Module):
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         n_classes = logits.shape[1]
+        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
         probs = torch.softmax(logits, dim=1)
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
 
         valid_mask = target != self.ignore_index
         target_safe = target.clone()
@@ -206,6 +211,8 @@ def get_args_parser():
         help="Metric used for best checkpointing and early stopping",
     )
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="Gradient clipping max norm (<=0 to disable)")
+    parser.add_argument("--skip-nonfinite-batches", action="store_true", help="Skip batches where total loss is NaN/Inf")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="efficient DDRNET-23-slim", help="Experiment ID for Weights & Biases")
 
@@ -346,12 +353,23 @@ def main(args):
             loss_iou = iou_criterion(main_logits, labels)
             loss = loss_main + args.aux_weight * loss_aux + args.dice_weight * loss_dice + args.iou_weight * loss_iou
 
+            if not torch.isfinite(loss):
+                wandb.log({
+                    "nonfinite_loss_batches": 1,
+                    "epoch": epoch + 1,
+                }, step=epoch * len(train_dataloader) + i)
+                if args.skip_nonfinite_batches:
+                    continue
+                raise RuntimeError("Non-finite loss encountered; try lower lr or enable --skip-nonfinite-batches")
+
             train_losses_total.append(loss.item())
             train_losses_main.append(loss_main.item())
             train_losses_dice.append(loss_dice.item())
             train_losses_iou.append(loss_iou.item())
 
             loss.backward()
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
             optimizer.step()
 
             wandb.log({
