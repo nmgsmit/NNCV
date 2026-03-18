@@ -10,7 +10,7 @@ class Model(nn.Module):
 	During evaluation it returns only main_logits to keep inference API simple.
 	"""
 
-	def __init__(self, in_channels=3, n_classes=19, embed_dims=(32, 64, 160, 256), depths=(2, 2, 2, 2), sr_ratios=(8, 4, 2, 1), num_heads=(1, 2, 5, 8)):
+	def __init__(self, in_channels=3, n_classes=19, embed_dims=(64, 128, 320, 512), depths=(3, 6, 40, 3), sr_ratios=(8, 4, 2, 1), num_heads=(1, 2, 5, 8), decoder_embedding_dim=768):
 		super().__init__()
 		self.in_channels = in_channels
 		self.n_classes = n_classes
@@ -30,7 +30,7 @@ class Model(nn.Module):
 
 		self.decode_head = SegFormerHead(
 			in_channels=embed_dims,
-			embedding_dim=256,
+			embedding_dim=decoder_embedding_dim,
 			n_classes=n_classes,
 		)
 		self.aux_head = nn.Conv2d(embed_dims[2], n_classes, kernel_size=1)

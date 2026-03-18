@@ -5,12 +5,12 @@ wandb login
 
 # Tune workers to available CPU threads while avoiding oversubscription on shared nodes.
 NUM_WORKERS=${NUM_WORKERS:-8}
-EXPERIMENT_ID=${EXPERIMENT_ID:-"DDRNET-23-slim BEST"}
+EXPERIMENT_ID=${EXPERIMENT_ID:-"Segformer Large"}
 
 python3 train.py \
     --data-dir ./data/cityscapes \
     --batch-size 16 \
-    --epochs 100 \
+    --epochs 50 \
     --lr 1e-2 \
     --momentum 0.9 \
     --weight-decay 1e-3 \
