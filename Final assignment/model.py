@@ -4,94 +4,45 @@ import torch.nn.functional as F
 
 
 class Model(nn.Module):
-	"""DDRNet-23-slim style dual-resolution segmentation model.
+	"""SegFormer-style semantic segmentation model (MiT encoder + MLP decode head).
 
 	During training the model returns (main_logits, aux_logits).
 	During evaluation it returns only main_logits to keep inference API simple.
 	"""
 
-	def __init__(self, in_channels=3, n_classes=19):
+	def __init__(self, in_channels=3, n_classes=19, embed_dims=(32, 64, 160, 256), depths=(2, 2, 2, 2), sr_ratios=(8, 4, 2, 1), num_heads=(1, 2, 5, 8)):
 		super().__init__()
 		self.in_channels = in_channels
 		self.n_classes = n_classes
 
-		# Stem: output stride 4.
-		self.stem = nn.Sequential(
-			ConvBNReLU(in_channels, 32, kernel_size=3, stride=2, padding=1),
-			ConvBNReLU(32, 32, kernel_size=3, stride=2, padding=1),
+		if len(embed_dims) != 4 or len(depths) != 4 or len(sr_ratios) != 4 or len(num_heads) != 4:
+			raise ValueError("embed_dims, depths, sr_ratios and num_heads must all have length 4")
+
+		self.encoder = MixVisionTransformerEncoder(
+			in_channels=in_channels,
+			embed_dims=embed_dims,
+			depths=depths,
+			num_heads=num_heads,
+			mlp_ratio=4.0,
+			sr_ratios=sr_ratios,
+			drop_rate=0.0,
 		)
 
-		# Shared shallow stages.
-		self.layer1 = self._make_layer(32, 32, blocks=2, stride=1)
-		self.layer2 = self._make_layer(32, 64, blocks=2, stride=2)  # 1/8
-
-		# Dual-resolution stage 3.
-		self.high3 = self._make_layer(64, 64, blocks=2, stride=1)
-		self.down3 = ConvBNReLU(64, 128, kernel_size=3, stride=2, padding=1)  # 1/16
-		self.low3 = self._make_layer(128, 128, blocks=2, stride=1)
-		self.low3_to_high = nn.Conv2d(128, 64, kernel_size=1, bias=False)
-		self.high3_to_low = ConvBNReLU(64, 128, kernel_size=3, stride=2, padding=1)
-
-		# Dual-resolution stage 4.
-		self.high4 = self._make_layer(64, 64, blocks=2, stride=1)
-		self.down4 = ConvBNReLU(128, 256, kernel_size=3, stride=2, padding=1)  # 1/32
-		self.low4 = self._make_layer(256, 256, blocks=2, stride=1)
-		self.low4_to_high = nn.Conv2d(256, 64, kernel_size=1, bias=False)
-		self.high4_to_low = ConvBNReLU(64, 256, kernel_size=3, stride=2, padding=1)
-
-		# Context aggregation and heads.
-		self.dappm = DAPPM(in_channels=256, branch_channels=64, out_channels=128)
-		self.fuse = ConvBNReLU(64 + 128, 128, kernel_size=3, stride=1, padding=1)
-		self.head = SegHead(128, 64, n_classes)
-		self.aux_head = SegHead(64, 32, n_classes)
-
-	def _make_layer(self, in_channels, out_channels, blocks, stride):
-		layers = [BasicBlock(in_channels, out_channels, stride=stride)]
-		for _ in range(1, blocks):
-			layers.append(BasicBlock(out_channels, out_channels, stride=1))
-		return nn.Sequential(*layers)
+		self.decode_head = SegFormerHead(
+			in_channels=embed_dims,
+			embedding_dim=256,
+			n_classes=n_classes,
+		)
+		self.aux_head = nn.Conv2d(embed_dims[2], n_classes, kernel_size=1)
 
 	def forward(self, x):
 		if x.shape[1] != self.in_channels:
 			raise ValueError(f"Expected {self.in_channels} channels, got {x.shape[1]}")
 
 		input_size = x.shape[-2:]
-
-		x = self.stem(x)
-		x = self.layer1(x)
-		x = self.layer2(x)
-
-		# Stage 3 bilateral fusion.
-		high = self.high3(x)
-		low = self.low3(self.down3(x))
-
-		high = high + F.interpolate(self.low3_to_high(low), size=high.shape[-2:], mode="bilinear", align_corners=False)
-		low = low + F.interpolate(
-			self.high3_to_low(high),
-			size=low.shape[-2:],
-			mode="bilinear",
-			align_corners=False,
-		)
-
-		# Stage 4 bilateral fusion.
-		high = self.high4(high)
-		low = self.low4(self.down4(low))
-
-		high = high + F.interpolate(self.low4_to_high(low), size=high.shape[-2:], mode="bilinear", align_corners=False)
-		low = low + F.interpolate(
-			self.high4_to_low(high),
-			size=low.shape[-2:],
-			mode="bilinear",
-			align_corners=False,
-		)
-
-		aux_logits = self.aux_head(high)
-
-		low_ctx = self.dappm(low)
-		low_ctx = F.interpolate(low_ctx, size=high.shape[-2:], mode="bilinear", align_corners=False)
-
-		fused = self.fuse(torch.cat([high, low_ctx], dim=1))
-		main_logits = self.head(fused)
+		features = self.encoder(x)
+		main_logits = self.decode_head(features)
+		aux_logits = self.aux_head(features[2])
 
 		main_logits = F.interpolate(main_logits, size=input_size, mode="bilinear", align_corners=False)
 		aux_logits = F.interpolate(aux_logits, size=input_size, mode="bilinear", align_corners=False)
@@ -101,117 +52,204 @@ class Model(nn.Module):
 		return main_logits
 
 
-class ConvBNReLU(nn.Module):
-	def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+class OverlapPatchEmbed(nn.Module):
+	def __init__(self, in_channels, embed_dim, patch_size, stride):
 		super().__init__()
-		self.block = nn.Sequential(
-			nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False),
-			nn.BatchNorm2d(out_channels),
-			nn.ReLU(inplace=True),
-		)
+		padding = patch_size // 2
+		self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=stride, padding=padding)
+		self.norm = nn.LayerNorm(embed_dim)
 
 	def forward(self, x):
-		return self.block(x)
+		x = self.proj(x)
+		b, c, h, w = x.shape
+		x = x.flatten(2).transpose(1, 2)
+		x = self.norm(x)
+		return x, h, w
 
 
-class BasicBlock(nn.Module):
-	expansion = 1
-
-	def __init__(self, in_channels, out_channels, stride=1):
+class EfficientSelfAttention(nn.Module):
+	def __init__(self, dim, num_heads=1, sr_ratio=1, attn_drop=0.0, proj_drop=0.0):
 		super().__init__()
-		self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-		self.bn1 = nn.BatchNorm2d(out_channels)
-		self.relu = nn.ReLU(inplace=True)
-		self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-		self.bn2 = nn.BatchNorm2d(out_channels)
+		if dim % num_heads != 0:
+			raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
 
-		if stride != 1 or in_channels != out_channels:
-			self.downsample = nn.Sequential(
-				nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-				nn.BatchNorm2d(out_channels),
-			)
+		self.dim = dim
+		self.num_heads = num_heads
+		self.head_dim = dim // num_heads
+		self.scale = self.head_dim ** -0.5
+		self.sr_ratio = sr_ratio
+
+		self.q = nn.Linear(dim, dim)
+		self.kv = nn.Linear(dim, dim * 2)
+		self.attn_drop = nn.Dropout(attn_drop)
+		self.proj = nn.Linear(dim, dim)
+		self.proj_drop = nn.Dropout(proj_drop)
+
+		if sr_ratio > 1:
+			self.sr = nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio)
+			self.norm = nn.LayerNorm(dim)
 		else:
-			self.downsample = None
+			self.sr = None
+			self.norm = None
+
+	def forward(self, x, h, w):
+		b, n, c = x.shape
+
+		q = self.q(x).reshape(b, n, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+		if self.sr is not None:
+			x_ = x.transpose(1, 2).reshape(b, c, h, w)
+			x_ = self.sr(x_).reshape(b, c, -1).transpose(1, 2)
+			x_ = self.norm(x_)
+		else:
+			x_ = x
+
+		kv = self.kv(x_).reshape(b, -1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+		k, v = kv[0], kv[1]
+
+		attn = (q @ k.transpose(-2, -1)) * self.scale
+		attn = attn.softmax(dim=-1)
+		attn = self.attn_drop(attn)
+
+		x = (attn @ v).transpose(1, 2).reshape(b, n, c)
+		x = self.proj(x)
+		x = self.proj_drop(x)
+		return x
+
+
+class MixFFN(nn.Module):
+	def __init__(self, dim, hidden_dim, drop=0.0):
+		super().__init__()
+		self.fc1 = nn.Linear(dim, hidden_dim)
+		self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1, groups=hidden_dim)
+		self.act = nn.GELU()
+		self.fc2 = nn.Linear(hidden_dim, dim)
+		self.drop = nn.Dropout(drop)
+
+	def forward(self, x, h, w):
+		x = self.fc1(x)
+		b, n, c = x.shape
+		x = x.transpose(1, 2).reshape(b, c, h, w)
+		x = self.dwconv(x)
+		x = x.flatten(2).transpose(1, 2)
+		x = self.act(x)
+		x = self.drop(x)
+		x = self.fc2(x)
+		x = self.drop(x)
+		return x
+
+
+class TransformerBlock(nn.Module):
+	def __init__(self, dim, num_heads, mlp_ratio=4.0, sr_ratio=1, drop=0.0):
+		super().__init__()
+		self.norm1 = nn.LayerNorm(dim)
+		self.attn = EfficientSelfAttention(dim=dim, num_heads=num_heads, sr_ratio=sr_ratio, attn_drop=drop, proj_drop=drop)
+		self.norm2 = nn.LayerNorm(dim)
+		hidden_dim = int(dim * mlp_ratio)
+		self.mlp = MixFFN(dim=dim, hidden_dim=hidden_dim, drop=drop)
+
+	def forward(self, x, h, w):
+		x = x + self.attn(self.norm1(x), h, w)
+		x = x + self.mlp(self.norm2(x), h, w)
+		return x
+
+
+class MixVisionStage(nn.Module):
+	def __init__(self, in_channels, embed_dim, depth, num_heads, sr_ratio, patch_size, stride, drop_rate=0.0):
+		super().__init__()
+		self.patch_embed = OverlapPatchEmbed(in_channels=in_channels, embed_dim=embed_dim, patch_size=patch_size, stride=stride)
+		self.blocks = nn.ModuleList(
+			[TransformerBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=4.0, sr_ratio=sr_ratio, drop=drop_rate) for _ in range(depth)]
+		)
+		self.norm = nn.LayerNorm(embed_dim)
 
 	def forward(self, x):
-		identity = x
-
-		out = self.conv1(x)
-		out = self.bn1(out)
-		out = self.relu(out)
-
-		out = self.conv2(out)
-		out = self.bn2(out)
-
-		if self.downsample is not None:
-			identity = self.downsample(x)
-
-		out = out + identity
-		out = self.relu(out)
+		tokens, h, w = self.patch_embed(x)
+		for block in self.blocks:
+			tokens = block(tokens, h, w)
+		tokens = self.norm(tokens)
+		b, _, c = tokens.shape
+		out = tokens.transpose(1, 2).reshape(b, c, h, w)
 		return out
 
 
-class DAPPM(nn.Module):
-	def __init__(self, in_channels, branch_channels, out_channels):
+class MixVisionTransformerEncoder(nn.Module):
+	def __init__(self, in_channels, embed_dims, depths, num_heads, sr_ratios, mlp_ratio=4.0, drop_rate=0.0):
 		super().__init__()
-		self.scale0 = nn.Sequential(
-			nn.BatchNorm2d(in_channels),
-			nn.ReLU(inplace=True),
-			nn.Conv2d(in_channels, branch_channels, kernel_size=1, bias=False),
+		self.mlp_ratio = mlp_ratio
+		self.stage1 = MixVisionStage(
+			in_channels=in_channels,
+			embed_dim=embed_dims[0],
+			depth=depths[0],
+			num_heads=num_heads[0],
+			sr_ratio=sr_ratios[0],
+			patch_size=7,
+			stride=4,
+			drop_rate=drop_rate,
 		)
-		self.scale1 = nn.Sequential(
-			nn.AvgPool2d(kernel_size=5, stride=2, padding=2),
-			nn.BatchNorm2d(in_channels),
-			nn.ReLU(inplace=True),
-			nn.Conv2d(in_channels, branch_channels, kernel_size=1, bias=False),
+		self.stage2 = MixVisionStage(
+			in_channels=embed_dims[0],
+			embed_dim=embed_dims[1],
+			depth=depths[1],
+			num_heads=num_heads[1],
+			sr_ratio=sr_ratios[1],
+			patch_size=3,
+			stride=2,
+			drop_rate=drop_rate,
 		)
-		self.scale2 = nn.Sequential(
-			nn.AvgPool2d(kernel_size=9, stride=4, padding=4),
-			nn.BatchNorm2d(in_channels),
-			nn.ReLU(inplace=True),
-			nn.Conv2d(in_channels, branch_channels, kernel_size=1, bias=False),
+		self.stage3 = MixVisionStage(
+			in_channels=embed_dims[1],
+			embed_dim=embed_dims[2],
+			depth=depths[2],
+			num_heads=num_heads[2],
+			sr_ratio=sr_ratios[2],
+			patch_size=3,
+			stride=2,
+			drop_rate=drop_rate,
 		)
-		self.scale3 = nn.Sequential(
-			nn.AvgPool2d(kernel_size=17, stride=8, padding=8),
-			nn.BatchNorm2d(in_channels),
-			nn.ReLU(inplace=True),
-			nn.Conv2d(in_channels, branch_channels, kernel_size=1, bias=False),
-		)
-		self.scale4 = nn.Sequential(
-			nn.AdaptiveAvgPool2d(1),
-			nn.BatchNorm2d(in_channels),
-			nn.ReLU(inplace=True),
-			nn.Conv2d(in_channels, branch_channels, kernel_size=1, bias=False),
-		)
-
-		self.process1 = ConvBNReLU(branch_channels, branch_channels, kernel_size=3, stride=1, padding=1)
-		self.process2 = ConvBNReLU(branch_channels, branch_channels, kernel_size=3, stride=1, padding=1)
-		self.process3 = ConvBNReLU(branch_channels, branch_channels, kernel_size=3, stride=1, padding=1)
-		self.process4 = ConvBNReLU(branch_channels, branch_channels, kernel_size=3, stride=1, padding=1)
-		self.compression = ConvBNReLU(branch_channels * 5, out_channels, kernel_size=1, stride=1, padding=0)
-		self.shortcut = ConvBNReLU(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-
-	def forward(self, x):
-		height, width = x.shape[-2:]
-
-		x0 = self.scale0(x)
-		x1 = self.process1(F.interpolate(self.scale1(x), size=(height, width), mode="bilinear", align_corners=False) + x0)
-		x2 = self.process2(F.interpolate(self.scale2(x), size=(height, width), mode="bilinear", align_corners=False) + x1)
-		x3 = self.process3(F.interpolate(self.scale3(x), size=(height, width), mode="bilinear", align_corners=False) + x2)
-		x4 = self.process4(F.interpolate(self.scale4(x), size=(height, width), mode="bilinear", align_corners=False) + x3)
-
-		out = self.compression(torch.cat([x0, x1, x2, x3, x4], dim=1))
-		out = out + self.shortcut(x)
-		return out
-
-
-class SegHead(nn.Module):
-	def __init__(self, in_channels, mid_channels, out_channels):
-		super().__init__()
-		self.block = nn.Sequential(
-			ConvBNReLU(in_channels, mid_channels, kernel_size=3, stride=1, padding=1),
-			nn.Conv2d(mid_channels, out_channels, kernel_size=1, bias=True),
+		self.stage4 = MixVisionStage(
+			in_channels=embed_dims[2],
+			embed_dim=embed_dims[3],
+			depth=depths[3],
+			num_heads=num_heads[3],
+			sr_ratio=sr_ratios[3],
+			patch_size=3,
+			stride=2,
+			drop_rate=drop_rate,
 		)
 
 	def forward(self, x):
-		return self.block(x)
+		c1 = self.stage1(x)
+		c2 = self.stage2(c1)
+		c3 = self.stage3(c2)
+		c4 = self.stage4(c3)
+		return c1, c2, c3, c4
+
+
+class SegFormerHead(nn.Module):
+	def __init__(self, in_channels, embedding_dim, n_classes):
+		super().__init__()
+		self.proj1 = nn.Conv2d(in_channels[0], embedding_dim, kernel_size=1)
+		self.proj2 = nn.Conv2d(in_channels[1], embedding_dim, kernel_size=1)
+		self.proj3 = nn.Conv2d(in_channels[2], embedding_dim, kernel_size=1)
+		self.proj4 = nn.Conv2d(in_channels[3], embedding_dim, kernel_size=1)
+
+		self.fuse = nn.Sequential(
+			nn.Conv2d(embedding_dim * 4, embedding_dim, kernel_size=1, bias=False),
+			nn.BatchNorm2d(embedding_dim),
+			nn.ReLU(inplace=True),
+			nn.Dropout2d(0.1),
+		)
+		self.classifier = nn.Conv2d(embedding_dim, n_classes, kernel_size=1)
+
+	def forward(self, features):
+		c1, c2, c3, c4 = features
+		h, w = c1.shape[-2:]
+
+		p1 = self.proj1(c1)
+		p2 = F.interpolate(self.proj2(c2), size=(h, w), mode="bilinear", align_corners=False)
+		p3 = F.interpolate(self.proj3(c3), size=(h, w), mode="bilinear", align_corners=False)
+		p4 = F.interpolate(self.proj4(c4), size=(h, w), mode="bilinear", align_corners=False)
+
+		fused = self.fuse(torch.cat([p1, p2, p3, p4], dim=1))
+		return self.classifier(fused)
