@@ -11,10 +11,12 @@ python3 train.py \
     --data-dir ./data/cityscapes \
     --batch-size 16 \
     --epochs 50 \
-    --lr 1e-2 \
+    --lr 6e-3 \
     --momentum 0.9 \
     --weight-decay 1e-3 \
-    --poly-power 0.9 \
+    --poly-power 0.7 \
+    --lr-decay-start-fraction 0.2 \
+    --min-lr-ratio 0.15 \
     --ohem-thresh 0.7 \
     --ohem-min-kept 131072 \
     --aux-weight 0.4 \

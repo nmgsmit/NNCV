@@ -141,8 +141,25 @@ class DiceLoss(nn.Module):
         return 1.0 - dice.mean()
 
 
-def poly_lr(base_lr: float, current_iter: int, max_iter: int, power: float = 0.9) -> float:
-    return base_lr * ((1.0 - float(current_iter) / max_iter) ** power)
+def poly_lr(
+    base_lr: float,
+    current_iter: int,
+    max_iter: int,
+    power: float = 0.9,
+    decay_start_fraction: float = 0.0,
+    min_lr_ratio: float = 0.0,
+) -> float:
+    # Keep LR flat until decay_start_fraction of training, then apply poly decay.
+    decay_start_iter = int(max_iter * decay_start_fraction)
+
+    if current_iter <= decay_start_iter:
+        return base_lr
+
+    decay_iters = max(max_iter - decay_start_iter, 1)
+    progress = min(max((current_iter - decay_start_iter) / decay_iters, 0.0), 1.0)
+    decayed_lr = base_lr * ((1.0 - progress) ** power)
+    min_lr = base_lr * min_lr_ratio
+    return max(decayed_lr, min_lr)
 
 
 def update_ema_model(ema_model: nn.Module, model: nn.Module, decay: float):
@@ -167,6 +184,8 @@ def get_args_parser():
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum for SGD")
     parser.add_argument("--weight-decay", type=float, default=5e-4, help="Weight decay")
     parser.add_argument("--poly-power", type=float, default=0.9, help="Power for poly learning rate schedule")
+    parser.add_argument("--lr-decay-start-fraction", type=float, default=0.0, help="Fraction of training before LR decay starts")
+    parser.add_argument("--min-lr-ratio", type=float, default=0.0, help="Minimum LR as a ratio of base LR")
     parser.add_argument("--ohem-thresh", type=float, default=0.7, help="OHEM threshold")
     parser.add_argument("--ohem-min-kept", type=int, default=131072, help="Minimum hard pixels for OHEM")
     parser.add_argument("--aux-weight", type=float, default=0.4, help="Weight for auxiliary OHEM loss")
@@ -301,7 +320,14 @@ def main(args):
 
             labels = labels.long().squeeze(1)  # Remove channel dimension
 
-            current_lr = poly_lr(args.lr, global_iter, max_iter, args.poly_power)
+            current_lr = poly_lr(
+                args.lr,
+                global_iter,
+                max_iter,
+                args.poly_power,
+                args.lr_decay_start_fraction,
+                args.min_lr_ratio,
+            )
             for param_group in optimizer.param_groups:
                 param_group["lr"] = current_lr
 
