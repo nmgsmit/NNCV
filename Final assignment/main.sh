@@ -9,14 +9,17 @@ EXPERIMENT_ID=${EXPERIMENT_ID:-"Segformer Large"}
 
 python3 train.py \
     --data-dir ./data/cityscapes \
+    --optimizer adamw \
     --batch-size 16 \
+    --base-batch-size 16 \
+    --scale-lr-with-batch \
     --epochs 50 \
-    --lr 6e-3 \
+    --lr 6e-5 \
     --momentum 0.9 \
-    --weight-decay 1e-3 \
-    --poly-power 0.7 \
-    --lr-decay-start-fraction 0.2 \
-    --min-lr-ratio 0.15 \
+    --weight-decay 0.01 \
+    --warmup-iters 1500 \
+    --poly-power 0.9 \
+    --min-lr-ratio 0.0 \
     --ohem-thresh 0.7 \
     --ohem-min-kept 131072 \
     --aux-weight 0.4 \

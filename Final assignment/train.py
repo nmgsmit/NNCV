@@ -19,7 +19,7 @@ from argparse import ArgumentParser
 import wandb
 import torch
 import torch.nn as nn
-from torch.optim import SGD
+from torch.optim import SGD, AdamW
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import Cityscapes
 from torchvision.utils import make_grid
@@ -145,19 +145,23 @@ def poly_lr(
     base_lr: float,
     current_iter: int,
     max_iter: int,
+    warmup_iters: int = 1500,
     power: float = 0.9,
-    decay_start_fraction: float = 0.0,
     min_lr_ratio: float = 0.0,
 ) -> float:
-    # Keep LR flat until decay_start_fraction of training, then apply poly decay.
-    decay_start_iter = int(max_iter * decay_start_fraction)
-
-    if current_iter <= decay_start_iter:
+    if max_iter <= 0:
         return base_lr
 
-    decay_iters = max(max_iter - decay_start_iter, 1)
-    progress = min(max((current_iter - decay_start_iter) / decay_iters, 0.0), 1.0)
-    decayed_lr = base_lr * ((1.0 - progress) ** power)
+    # Linear warmup for early optimization stability.
+    if warmup_iters > 0 and current_iter < warmup_iters:
+        warmup_scale = float(current_iter + 1) / float(max(warmup_iters, 1))
+        return base_lr * warmup_scale
+
+    poly_start_iter = min(max(warmup_iters, 0), max_iter)
+    poly_total_iters = max(max_iter - poly_start_iter, 1)
+    poly_progress = min(max((current_iter - poly_start_iter) / poly_total_iters, 0.0), 1.0)
+
+    decayed_lr = base_lr * ((1.0 - poly_progress) ** power)
     min_lr = base_lr * min_lr_ratio
     return max(decayed_lr, min_lr)
 
@@ -178,13 +182,16 @@ def get_args_parser():
 
     parser = ArgumentParser("Training script for a PyTorch U-Net model")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd", "adamw"], help="Optimizer type")
     parser.add_argument("--batch-size", type=int, default=16, help="Training batch size")
+    parser.add_argument("--base-batch-size", type=int, default=16, help="Reference batch size used for LR scaling")
+    parser.add_argument("--scale-lr-with-batch", action="store_true", help="Scale LR linearly with batch size")
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-2, help="Initial learning rate for poly decay")
+    parser.add_argument("--lr", type=float, default=6e-5, help="Base learning rate")
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum for SGD")
-    parser.add_argument("--weight-decay", type=float, default=5e-4, help="Weight decay")
+    parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay")
+    parser.add_argument("--warmup-iters", type=int, default=1500, help="Linear warmup iterations")
     parser.add_argument("--poly-power", type=float, default=0.9, help="Power for poly learning rate schedule")
-    parser.add_argument("--lr-decay-start-fraction", type=float, default=0.0, help="Fraction of training before LR decay starts")
     parser.add_argument("--min-lr-ratio", type=float, default=0.0, help="Minimum LR as a ratio of base LR")
     parser.add_argument("--ohem-thresh", type=float, default=0.7, help="OHEM threshold")
     parser.add_argument("--ohem-min-kept", type=int, default=131072, help="Minimum hard pixels for OHEM")
@@ -292,13 +299,25 @@ def main(args):
     )
     dice_criterion = DiceLoss(ignore_index=255)
 
+    lr_scale = 1.0
+    if args.scale_lr_with_batch:
+        lr_scale = float(args.batch_size) / float(max(args.base_batch_size, 1))
+    effective_base_lr = args.lr * lr_scale
+
     # Define the optimizer
-    optimizer = SGD(
-        model.parameters(),
-        lr=args.lr,
-        momentum=args.momentum,
-        weight_decay=args.weight_decay,
-    )
+    if args.optimizer == "adamw":
+        optimizer = AdamW(
+            model.parameters(),
+            lr=effective_base_lr,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = SGD(
+            model.parameters(),
+            lr=effective_base_lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
 
     max_iter = args.epochs * len(train_dataloader)
     global_iter = 0
@@ -321,11 +340,11 @@ def main(args):
             labels = labels.long().squeeze(1)  # Remove channel dimension
 
             current_lr = poly_lr(
-                args.lr,
+                effective_base_lr,
                 global_iter,
                 max_iter,
+                args.warmup_iters,
                 args.poly_power,
-                args.lr_decay_start_fraction,
                 args.min_lr_ratio,
             )
             for param_group in optimizer.param_groups:
