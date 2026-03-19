@@ -54,6 +54,42 @@ def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
     return color_image
 
 
+def update_confusion_matrix(
+    confusion_matrix: torch.Tensor,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    n_classes: int,
+    ignore_index: int = 255,
+) -> torch.Tensor:
+    valid_mask = target != ignore_index
+    if not valid_mask.any():
+        return confusion_matrix
+
+    target = target[valid_mask]
+    prediction = prediction[valid_mask]
+    encoded = target * n_classes + prediction
+    confusion_matrix += torch.bincount(encoded, minlength=n_classes * n_classes).reshape(n_classes, n_classes)
+    return confusion_matrix
+
+
+def compute_mean_iou(confusion_matrix: torch.Tensor, eps: float = 1e-6) -> tuple[float, torch.Tensor]:
+    true_positive = confusion_matrix.diag()
+    false_positive = confusion_matrix.sum(dim=0) - true_positive
+    false_negative = confusion_matrix.sum(dim=1) - true_positive
+    denominator = true_positive + false_positive + false_negative
+    valid_classes = denominator > 0
+
+    iou_per_class = torch.zeros_like(true_positive, dtype=torch.float32)
+    iou_per_class[valid_classes] = true_positive[valid_classes].float() / (denominator[valid_classes].float() + eps)
+
+    if valid_classes.any():
+        mean_iou = iou_per_class[valid_classes].mean().item()
+    else:
+        mean_iou = 0.0
+
+    return mean_iou, iou_per_class
+
+
 class OHEMCrossEntropyLoss(nn.Module):
     def __init__(self, ignore_index=255, thresh=0.7, min_kept=131072, label_smoothing=0.0):
         super().__init__()
@@ -269,6 +305,7 @@ def main(args):
         min_kept=args.ohem_min_kept,
         label_smoothing=args.label_smoothing,
     )
+    valid_ce_criterion = nn.CrossEntropyLoss(ignore_index=255, label_smoothing=args.label_smoothing)
     dice_criterion = DiceLoss(ignore_index=255)
 
     # Define the optimizer
@@ -281,7 +318,7 @@ def main(args):
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode="min",
+        mode="max",
         factor=0.5,
         patience=3,
         threshold=1e-4,
@@ -289,7 +326,7 @@ def main(args):
     )
 
     best_valid_loss = float("inf")
-    best_dice = -float('inf')
+    best_valid_miou = -float("inf")
     epochs_without_improvement = 0
     best_model_path = os.path.join(output_dir, "best_model.pt")
     for epoch in range(args.epochs):
@@ -298,6 +335,8 @@ def main(args):
         # Training
         model.train()
         train_losses_total = []
+        train_main_losses = []
+        train_dice_losses = []
         for i, (images, labels) in enumerate(train_dataloader):
             labels = convert_to_train_id(labels)
             images = images.to(device, non_blocking=True)
@@ -321,9 +360,10 @@ def main(args):
             optimizer.step()
 
             train_losses_total.append(loss.item())
+            train_main_losses.append(loss_main.item())
+            train_dice_losses.append(loss_dice.item())
 
             wandb.log({
-                "train_loss": loss.item(),
                 "learning_rate": optimizer.param_groups[0]['lr'],
                 "epoch": epoch + 1,
             }, step=epoch * len(train_dataloader) + i)
@@ -333,7 +373,9 @@ def main(args):
 
         with torch.no_grad():
             valid_losses_total = []
-            valid_dice_scores = []
+            valid_ce_losses = []
+            valid_dice_losses = []
+            confusion_matrix = torch.zeros((model.n_classes, model.n_classes), dtype=torch.int64)
             for i, (images, labels) in enumerate(valid_dataloader):
                 labels = convert_to_train_id(labels)
                 images = images.to(device, non_blocking=True)
@@ -342,19 +384,24 @@ def main(args):
                 outputs = model(images)
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
-                loss_main = ohem_criterion(outputs, labels)
+                loss_main = valid_ce_criterion(outputs, labels)
                 loss_dice = dice_criterion(outputs, labels)
                 loss_total = loss_main + args.dice_weight * loss_dice
                 valid_losses_total.append(loss_total.item())
-                valid_dice_scores.append((1.0 - loss_dice.item()))
+                valid_ce_losses.append(loss_main.item())
+                valid_dice_losses.append(loss_dice.item())
+                predictions = outputs.argmax(1)
+                confusion_matrix = update_confusion_matrix(
+                    confusion_matrix,
+                    predictions.cpu(),
+                    labels.cpu(),
+                    model.n_classes,
+                )
                 if i == 0:
-                    predictions = outputs.softmax(1).argmax(1)
-                    predictions = predictions.unsqueeze(1)
-                    labels = labels.unsqueeze(1)
-                    predictions = convert_train_id_to_color(predictions)
-                    labels = convert_train_id_to_color(labels)
-                    predictions_img = make_grid(predictions.cpu(), nrow=8)
-                    labels_img = make_grid(labels.cpu(), nrow=8)
+                    predictions_vis = convert_train_id_to_color(predictions.unsqueeze(1).cpu())
+                    labels_vis = convert_train_id_to_color(labels.unsqueeze(1).cpu())
+                    predictions_img = make_grid(predictions_vis, nrow=8)
+                    labels_img = make_grid(labels_vis, nrow=8)
                     predictions_img = predictions_img.permute(1, 2, 0).numpy()
                     labels_img = labels_img.permute(1, 2, 0).numpy()
                     wandb.log({
@@ -362,19 +409,28 @@ def main(args):
                         "labels": [wandb.Image(labels_img)],
                     }, step=(epoch + 1) * len(train_dataloader) - 1)
             train_loss = sum(train_losses_total) / len(train_losses_total)
+            train_main_loss = sum(train_main_losses) / len(train_main_losses)
+            train_mean_dice = 1.0 - (sum(train_dice_losses) / len(train_dice_losses))
             valid_loss = sum(valid_losses_total) / len(valid_losses_total)
-            valid_mean_dice = sum(valid_dice_scores) / len(valid_dice_scores)
+            valid_ce_loss = sum(valid_ce_losses) / len(valid_ce_losses)
+            valid_mean_dice = 1.0 - (sum(valid_dice_losses) / len(valid_dice_losses))
+            valid_mean_iou, _ = compute_mean_iou(confusion_matrix)
             wandb.log({
+                "train_loss_step": train_losses_total[-1],
+                "train_loss": train_loss,
+                "train_main_loss": train_main_loss,
+                "train_mean_dice": train_mean_dice,
                 "valid_mean_dice": valid_mean_dice,
                 "valid_loss": valid_loss,
-                "train_loss": train_loss,
+                "valid_ce_loss": valid_ce_loss,
+                "valid_mean_iou": valid_mean_iou,
                 "learning_rate": optimizer.param_groups[0]['lr'],
                 "epoch": epoch + 1,
                 "generalization_gap": valid_loss - train_loss,
             }, step=(epoch + 1) * len(train_dataloader) - 1)
-            scheduler.step(valid_loss)
-            if valid_mean_dice > best_dice + args.early_stop_min_delta:
-                best_dice = valid_mean_dice
+            scheduler.step(valid_mean_iou)
+            if valid_mean_iou > best_valid_miou + args.early_stop_min_delta:
+                best_valid_miou = valid_mean_iou
                 best_valid_loss = valid_loss
 
                 torch.save(model.state_dict(), best_model_path)
@@ -382,7 +438,7 @@ def main(args):
             else:
                 epochs_without_improvement += 1
                 if epochs_without_improvement >= args.early_stop_patience:
-                    print(f"Early stopping at epoch {epoch + 1}: no Dice improvement for {args.early_stop_patience} epochs.")
+                    print(f"Early stopping at epoch {epoch + 1}: no mIoU improvement for {args.early_stop_patience} epochs.")
                     break
     print("Training complete!")
     if os.path.exists(best_model_path):
