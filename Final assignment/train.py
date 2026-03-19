@@ -1,50 +1,41 @@
 """
-This script implements a training loop for the model. It is designed to be flexible, 
-allowing you to easily modify hyperparameters using a command-line argument parser.
-
-### Key Features:
-1. **Hyperparameter Tuning:** Adjust hyperparameters by parsing arguments from the `main.sh` script or directly 
-   via the command line.
-2. **Remote Execution Support:** Since this script runs on a server, training progress is not visible on the console. 
-   To address this, we use the `wandb` library for logging and tracking progress and results.
-3. **Encapsulation:** The training loop is encapsulated in a function, enabling it to be called from the main block. 
-   This ensures proper execution when the script is run directly.
-
-Feel free to customize the script as needed for your use case.
+Training script for SegFormer on Cityscapes.
 """
-import os
+
 import copy
+import os
+import random
 from argparse import ArgumentParser
 
-import wandb
 import torch
 import torch.nn as nn
-from torch.optim import SGD, AdamW
+import wandb
+from torch.optim import AdamW, SGD
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import Cityscapes
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
+from torchvision.transforms import v2
+from torchvision.transforms.v2 import functional as F_v2
 from torchvision.utils import make_grid
-
-from torchvision.transforms.v2 import (
-    Compose,
-    Normalize,
-    Resize,
-    ToImage,
-    ToDtype,
-    InterpolationMode
-)
-import torchvision.transforms
 
 from model import Model
 
 
-# Mapping class IDs to train IDs
+IGNORE_INDEX = 255
+DEFAULT_TRAIN_SIZE = (512, 1024)
+CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
+CITYSCAPES_STD = (0.229, 0.224, 0.225)
+
+
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
+train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cls.train_id != IGNORE_INDEX}
+train_id_to_color[IGNORE_INDEX] = (0, 0, 0)
+
+
 def convert_to_train_id(label_img: torch.Tensor) -> torch.Tensor:
     return label_img.apply_(lambda x: id_to_trainid[x])
 
-# Mapping train IDs to color
-train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cls.train_id != 255}
-train_id_to_color[255] = (0, 0, 0)  # Assign black to ignored labels
 
 def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
     batch, _, height, width = prediction.shape
@@ -52,33 +43,118 @@ def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
 
     for train_id, color in train_id_to_color.items():
         mask = prediction[:, 0] == train_id
-
         for i in range(3):
             color_image[:, i][mask] = color[i]
 
     return color_image
 
 
-class AugmentedCityscapes(Dataset):
-    """Apply lightweight joint augmentations to image/mask pairs."""
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
 
-    def __init__(self, base_dataset: Dataset, hflip_prob: float = 0.0):
-        self.base_dataset = base_dataset
+
+class CityscapesJointTransform:
+    def __init__(
+        self,
+        image_size=DEFAULT_TRAIN_SIZE,
+        training=True,
+        hflip_prob=0.5,
+        color_jitter=0.4,
+        gaussian_blur=0.0,
+    ):
+        self.image_size = image_size
+        self.training = training
         self.hflip_prob = hflip_prob
+        self.gaussian_blur = gaussian_blur
 
-    def __len__(self):
-        return len(self.base_dataset)
+        self.color_jitter = None
+        if training and color_jitter > 0:
+            self.color_jitter = v2.ColorJitter(
+                brightness=color_jitter,
+                contrast=color_jitter,
+                saturation=color_jitter,
+                hue=min(0.1, color_jitter),
+            )
 
-    def __getitem__(self, index):
-        image, target = self.base_dataset[index]
-        if self.hflip_prob > 0.0 and torch.rand(1).item() < self.hflip_prob:
-            image = torch.flip(image, dims=[2])
-            target = torch.flip(target, dims=[2])
+    def __call__(self, image, target):
+        if self.training:
+            i, j, h, w = v2.RandomResizedCrop.get_params(
+                image,
+                scale=(0.5, 2.0),
+                ratio=(1.5, 2.0),
+            )
+            image = TF.resized_crop(
+                image,
+                i,
+                j,
+                h,
+                w,
+                self.image_size,
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            target = TF.resized_crop(
+                target,
+                i,
+                j,
+                h,
+                w,
+                self.image_size,
+                interpolation=InterpolationMode.NEAREST,
+            )
+
+            if self.hflip_prob > 0.0 and random.random() < self.hflip_prob:
+                image = TF.hflip(image)
+                target = TF.hflip(target)
+
+            image = TF.to_image(image)
+            if self.color_jitter is not None:
+                image = self.color_jitter(image)
+            if self.gaussian_blur > 0.0 and random.random() < self.gaussian_blur:
+                image = F_v2.gaussian_blur(image, kernel_size=3)
+        else:
+            image = TF.resize(
+                image,
+                self.image_size,
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            target = TF.resize(
+                target,
+                self.image_size,
+                interpolation=InterpolationMode.NEAREST,
+            )
+            image = TF.to_image(image)
+
+        image = TF.to_dtype(image, torch.float32, scale=True)
+        image = TF.normalize(image, mean=CITYSCAPES_MEAN, std=CITYSCAPES_STD)
+
+        target = TF.to_image(target)
+        target = TF.to_dtype(target, torch.int64, scale=False)
         return image, target
 
 
+class CityscapesSegmentationDataset(Dataset):
+    def __init__(self, root, split, transform):
+        self.dataset = Cityscapes(
+            root,
+            split=split,
+            mode="fine",
+            target_type="semantic",
+        )
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        image, target = self.dataset[index]
+        return self.transform(image, target)
+
+
 class OHEMCrossEntropyLoss(nn.Module):
-    def __init__(self, ignore_index=255, thresh=0.7, min_kept=131072, label_smoothing=0.0):
+    def __init__(self, ignore_index=IGNORE_INDEX, thresh=0.7, min_kept=131072, label_smoothing=0.0):
         super().__init__()
         self.ignore_index = ignore_index
         self.thresh = thresh
@@ -115,7 +191,7 @@ class OHEMCrossEntropyLoss(nn.Module):
 
 
 class DiceLoss(nn.Module):
-    def __init__(self, ignore_index=255, eps=1e-6):
+    def __init__(self, ignore_index=IGNORE_INDEX, eps=1e-6):
         super().__init__()
         self.ignore_index = ignore_index
         self.eps = eps
@@ -154,7 +230,6 @@ def poly_lr(
     if max_iter <= 0:
         return base_lr
 
-    # Linear warmup for early optimization stability.
     if warmup_iters > 0 and current_iter < warmup_iters:
         warmup_scale = float(current_iter + 1) / float(max(warmup_iters, 1))
         return base_lr * warmup_scale
@@ -180,9 +255,31 @@ def update_ema_model(ema_model: nn.Module, model: nn.Module, decay: float):
             ema_buffer.copy_(model_buffers[name])
 
 
-def get_args_parser():
+def update_confusion_matrix(confmat, logits, target, num_classes, ignore_index=IGNORE_INDEX):
+    pred = logits.argmax(dim=1)
+    valid = target != ignore_index
+    if not valid.any():
+        return
 
-    parser = ArgumentParser("Training script for a PyTorch U-Net model")
+    target = target[valid]
+    pred = pred[valid]
+    indices = target * num_classes + pred
+    confmat += torch.bincount(indices, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+
+def compute_mean_iou(confmat):
+    confmat = confmat.float()
+    intersection = torch.diag(confmat)
+    union = confmat.sum(dim=1) + confmat.sum(dim=0) - intersection
+    valid = union > 0
+    if not valid.any():
+        return 0.0
+    iou = intersection[valid] / union[valid]
+    return iou.mean().item()
+
+
+def get_args_parser():
+    parser = ArgumentParser("Training script for SegFormer-B5 on Cityscapes")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
     parser.add_argument("--pretrained-path", type=str, default="./mit-b5", help="Path to mit-b5 pretrained weights folder")
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd", "adamw"], help="Optimizer type")
@@ -199,132 +296,92 @@ def get_args_parser():
     parser.add_argument("--ohem-thresh", type=float, default=0.7, help="OHEM threshold")
     parser.add_argument("--ohem-min-kept", type=int, default=131072, help="Minimum hard pixels for OHEM")
     parser.add_argument("--aux-weight", type=float, default=0.4, help="Weight for auxiliary OHEM loss")
-    parser.add_argument("--dice-weight", type=float, default=1.0, help="Weight for dice loss")
+    parser.add_argument("--dice-weight", type=float, default=0.5, help="Weight for dice loss")
     parser.add_argument("--label-smoothing", type=float, default=0.05, help="Label smoothing for OHEM cross-entropy")
-    parser.add_argument("--early-stop-patience", type=int, default=6, help="Number of epochs without validation improvement before stopping")
+    parser.add_argument("--early-stop-patience", type=int, default=10, help="Number of epochs without validation improvement before stopping")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
     parser.add_argument("--hflip-prob", type=float, default=0.5, help="Horizontal flip probability for training augmentation")
     parser.add_argument("--color-jitter", type=float, default=0.4, help="Color jitter strength (0 disables)")
-    parser.add_argument("--random-crop", type=int, default=0, help="Random crop size (0 disables)")
     parser.add_argument("--gaussian-blur", type=float, default=0.0, help="Probability of Gaussian blur (0 disables)")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for evaluation model (<=0 disables EMA)")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="efficient SegFormer-B5", help="Experiment ID for Weights & Biases")
-
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for all dropout layers in SegFormer")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Decoder dropout rate for SegFormer")
     return parser
 
 
 def main(args):
-    # Initialize wandb for logging
     wandb.init(
-        project="5lsm0-cityscapes-segmentation",  # Project name in wandb
-        name=args.experiment_id,  # Experiment name in wandb
-        config=vars(args),  # Save hyperparameters
+        project="5lsm0-cityscapes-segmentation",
+        name=args.experiment_id,
+        config=vars(args),
     )
 
-    # Create output directory if it doesn't exist
     output_dir = os.path.join("checkpoints", args.experiment_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Set seed for reproducability
     torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = True
+    random.seed(args.seed)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
-    # Define the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    img_transforms = [
-        ToImage(),
-        torchvision.transforms.RandomResizedCrop(
-            size=(512, 1024),
-            scale=(0.5, 2.0),
-            ratio=(1.5, 2.0)
-        ),
-    ]
-
-    if args.color_jitter > 0:
-        img_transforms.append(torchvision.transforms.ColorJitter(
-            brightness=args.color_jitter,
-            contrast=args.color_jitter,
-            saturation=args.color_jitter,
-            hue=min(0.1, args.color_jitter)
-        ))
-
-    img_transforms += [
-        ToDtype(torch.float32, scale=True),
-        Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    ]
-
-    img_transform = Compose(img_transforms)
-
-    target_transform = Compose([
-        ToImage(),
-        torchvision.transforms.RandomResizedCrop(
-            size=(512, 1024),
-            scale=(0.5, 2.0),
-            ratio=(1.5, 2.0),
-            interpolation=InterpolationMode.NEAREST
-        ),
-        ToDtype(torch.int64),
-    ])
-
-    # Load the dataset and make a split for training and validation
-    train_base_dataset = Cityscapes(
-        args.data_dir,
-        split="train",
-        mode="fine",
-        target_type="semantic",
-        transform=img_transform,
-        target_transform=target_transform,
+    train_transform = CityscapesJointTransform(
+        image_size=DEFAULT_TRAIN_SIZE,
+        training=True,
+        hflip_prob=args.hflip_prob,
+        color_jitter=args.color_jitter,
+        gaussian_blur=args.gaussian_blur,
     )
-    train_dataset = AugmentedCityscapes(train_base_dataset, hflip_prob=args.hflip_prob)
-
-    valid_dataset = Cityscapes(
-        args.data_dir,
-        split="val",
-        mode="fine",
-        target_type="semantic",
-        transform=img_transform,
-        target_transform=target_transform,
+    valid_transform = CityscapesJointTransform(
+        image_size=DEFAULT_TRAIN_SIZE,
+        training=False,
+        hflip_prob=0.0,
+        color_jitter=0.0,
+        gaussian_blur=0.0,
     )
 
+    train_dataset = CityscapesSegmentationDataset(args.data_dir, split="train", transform=train_transform)
+    valid_dataset = CityscapesSegmentationDataset(args.data_dir, split="val", transform=valid_transform)
+
+    persistent_workers = args.num_workers > 0
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True
-    )   
-
+        drop_last=True,
+        persistent_workers=persistent_workers,
+        worker_init_fn=seed_worker,
+    )
     valid_dataloader = DataLoader(
-        valid_dataset, 
-        batch_size=args.batch_size, 
+        valid_dataset,
+        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=persistent_workers,
+        worker_init_fn=seed_worker,
     )
 
-    # Define the model with mit-b5 parameters
     model = Model(
         in_channels=3,
         n_classes=19,
-        embed_dims=(64, 128, 320, 512), # B5 params
-        depths=(3, 6, 40, 3),           # B5 params
+        embed_dims=(64, 128, 320, 512),
+        depths=(3, 6, 40, 3),
         sr_ratios=(8, 4, 2, 1),
         num_heads=(1, 2, 5, 8),
-        dropout=args.dropout
-    )
-    
-    # Load Pretrained Weights
+        dropout=args.dropout,
+    ).to(device)
+
     try:
         model.load_pretrained(args.pretrained_path)
     except Exception as e:
         print(f"Warning: Could not load pretrained weights. {e}")
         print("Training from scratch...")
-        
-    model = model.to(device)
 
     ema_model = None
     if args.ema_decay > 0.0:
@@ -333,21 +390,19 @@ def main(args):
         for p in ema_model.parameters():
             p.requires_grad = False
 
-    # Define the loss function
     ohem_criterion = OHEMCrossEntropyLoss(
-        ignore_index=255,
+        ignore_index=IGNORE_INDEX,
         thresh=args.ohem_thresh,
         min_kept=args.ohem_min_kept,
         label_smoothing=args.label_smoothing,
     )
-    dice_criterion = DiceLoss(ignore_index=255)
+    dice_criterion = DiceLoss(ignore_index=IGNORE_INDEX)
 
     lr_scale = 1.0
     if args.scale_lr_with_batch:
         lr_scale = float(args.batch_size) / float(max(args.base_batch_size, 1))
     effective_base_lr = args.lr * lr_scale
 
-    # Define the optimizer
     if args.optimizer == "adamw":
         optimizer = AdamW(
             model.parameters(),
@@ -362,158 +417,156 @@ def main(args):
             weight_decay=args.weight_decay,
         )
 
-
-    # Set up ReduceLROnPlateau scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=3,
-        threshold=1e-4,
-        min_lr=args.lr * args.min_lr_ratio,
-        verbose=True
-    )
     global_iter = 0
+    total_iters = args.epochs * len(train_dataloader)
 
-
-    # Training loop
-    best_valid_loss = float('inf')
-    best_dice = -float('inf')
+    best_miou = -float("inf")
+    best_valid_loss = float("inf")
     epochs_without_improvement = 0
     best_model_path = os.path.join(output_dir, "best_model.pt")
-    
+
     for epoch in range(args.epochs):
-        print(f"Epoch {epoch+1:04}/{args.epochs:04}")
+        print(f"Epoch {epoch + 1:04}/{args.epochs:04}")
 
-        # Training
         model.train()
+        train_loss_total = 0.0
+
         for i, (images, labels) in enumerate(train_dataloader):
-            labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
-            images, labels = images.to(device), labels.to(device)
-            labels = labels.long().squeeze(1)  # Remove channel dimension
+            labels = convert_to_train_id(labels)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True).long().squeeze(1)
 
-            optimizer.zero_grad()
+            current_lr = poly_lr(
+                base_lr=effective_base_lr,
+                current_iter=global_iter,
+                max_iter=total_iters,
+                warmup_iters=args.warmup_iters,
+                power=args.poly_power,
+                min_lr_ratio=args.min_lr_ratio,
+            )
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = current_lr
+
+            optimizer.zero_grad(set_to_none=True)
             outputs = model(images)
-
-            if isinstance(outputs, tuple):
-                main_logits, aux_logits = outputs
-            else:
-                main_logits, aux_logits = outputs, None
+            main_logits, aux_logits = outputs if isinstance(outputs, tuple) else (outputs, None)
 
             loss_main = ohem_criterion(main_logits, labels)
-            loss_aux = ohem_criterion(aux_logits, labels) if aux_logits is not None else torch.tensor(0.0, device=device)
+            loss_aux = (
+                ohem_criterion(aux_logits, labels)
+                if aux_logits is not None else torch.tensor(0.0, device=device)
+            )
             loss_dice = dice_criterion(main_logits, labels)
-            loss = loss_main + 0.4 * loss_aux + 0.5 * loss_dice
-            
+            loss = loss_main + args.aux_weight * loss_aux + args.dice_weight * loss_dice
+
             if not torch.isfinite(loss):
-                raise RuntimeError("Non-finite loss encountered; try lower lr or enable --skip-nonfinite-batches")
+                raise RuntimeError("Non-finite loss encountered; try lowering the learning rate.")
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            current_lr = poly_lr(
-                base_lr=effective_base_lr,
-                current_iter=global_iter,
-                max_iter=args.epochs * len(train_dataloader),
-                warmup_iters=args.warmup_iters,
-                power=args.poly_power,
-                min_lr_ratio=args.min_lr_ratio,
-            )
-
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = current_lr
-
             if ema_model is not None:
                 update_ema_model(ema_model, model, args.ema_decay)
 
-            wandb.log({
-                "train_loss": loss.item(),
-                "learning_rate": optimizer.param_groups[0]['lr'],
-                "epoch": epoch + 1,
-            }, step=epoch * len(train_dataloader) + i)
+            train_loss_total += loss.item()
+            wandb.log(
+                {
+                    "train_loss": loss.item(),
+                    "train_loss_main": loss_main.item(),
+                    "train_loss_aux": loss_aux.item(),
+                    "train_loss_dice": loss_dice.item(),
+                    "learning_rate": current_lr,
+                    "epoch": epoch + 1,
+                },
+                step=global_iter,
+            )
             global_iter += 1
 
-        # Validation
         model.eval()
         eval_model = ema_model if ema_model is not None else model
         eval_model.eval()
-        
+
         with torch.no_grad():
             valid_losses_total = []
             valid_dice_scores = []
-            
+            confmat = torch.zeros((19, 19), dtype=torch.int64, device=device)
+
             for i, (images, labels) in enumerate(valid_dataloader):
-                labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
-                images, labels = images.to(device), labels.to(device)
-                labels = labels.long().squeeze(1)  # Remove channel dimension
-                
+                labels = convert_to_train_id(labels)
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True).long().squeeze(1)
+
                 outputs = eval_model(images)
-                
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
-                    
+
                 loss_main = ohem_criterion(outputs, labels)
                 loss_dice = dice_criterion(outputs, labels)
                 loss_total = loss_main + args.dice_weight * loss_dice
-                
+
                 valid_losses_total.append(loss_total.item())
-                valid_dice_scores.append((1.0 - loss_dice.item()))
-                
+                valid_dice_scores.append(1.0 - loss_dice.item())
+                update_confusion_matrix(confmat, outputs, labels, num_classes=19)
+
                 if i == 0:
-                    predictions = outputs.softmax(1).argmax(1)
-                    predictions = predictions.unsqueeze(1)
-                    labels = labels.unsqueeze(1)
-                    predictions = convert_train_id_to_color(predictions)
-                    labels = convert_train_id_to_color(labels)
-                    predictions_img = make_grid(predictions.cpu(), nrow=8)
-                    labels_img = make_grid(labels.cpu(), nrow=8)
-                    predictions_img = predictions_img.permute(1, 2, 0).numpy()
-                    labels_img = labels_img.permute(1, 2, 0).numpy()
-                    
-                    wandb.log({
-                        "predictions": [wandb.Image(predictions_img)],
-                        "labels": [wandb.Image(labels_img)],
-                    }, step=(epoch + 1) * len(train_dataloader) - 1)
-                    
+                    predictions = outputs.argmax(1, keepdim=True)
+                    labels_vis = labels.unsqueeze(1)
+                    predictions = convert_train_id_to_color(predictions.cpu())
+                    labels_vis = convert_train_id_to_color(labels_vis.cpu())
+                    predictions_img = make_grid(predictions, nrow=8).permute(1, 2, 0).numpy()
+                    labels_img = make_grid(labels_vis, nrow=8).permute(1, 2, 0).numpy()
+
+                    wandb.log(
+                        {
+                            "predictions": [wandb.Image(predictions_img)],
+                            "labels": [wandb.Image(labels_img)],
+                        },
+                        step=global_iter - 1,
+                    )
+
             valid_loss = sum(valid_losses_total) / len(valid_losses_total)
             valid_mean_dice = sum(valid_dice_scores) / len(valid_dice_scores)
-            
-            wandb.log({
-                "valid_loss": valid_loss,
-                "valid_mean_dice": valid_mean_dice,
-                "epoch": epoch + 1,
-            }, step=(epoch + 1) * len(train_dataloader) - 1)
+            valid_miou = compute_mean_iou(confmat)
+            train_loss = train_loss_total / len(train_dataloader)
 
-            # Step the ReduceLROnPlateau scheduler
-            scheduler.step(valid_loss)
+            wandb.log(
+                {
+                    "epoch": epoch + 1,
+                    "epoch_train_loss": train_loss,
+                    "valid_loss": valid_loss,
+                    "valid_mean_dice": valid_mean_dice,
+                    "valid_miou": valid_miou,
+                },
+                step=global_iter - 1,
+            )
 
-            if valid_mean_dice > best_dice + args.early_stop_min_delta:
-                best_dice = valid_mean_dice
+            if valid_miou > best_miou + args.early_stop_min_delta:
+                best_miou = valid_miou
                 best_valid_loss = valid_loss
-                if ema_model is not None:
-                    torch.save(ema_model.state_dict(), best_model_path)
-                else:
-                    torch.save(model.state_dict(), best_model_path)
+                checkpoint_source = ema_model if ema_model is not None else model
+                torch.save(checkpoint_source.state_dict(), best_model_path)
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
                 if epochs_without_improvement >= args.early_stop_patience:
-                    print(f"Early stopping at epoch {epoch + 1}: no Dice improvement for {args.early_stop_patience} epochs.")
+                    print(
+                        f"Early stopping at epoch {epoch + 1}: "
+                        f"no mIoU improvement for {args.early_stop_patience} epochs."
+                    )
                     break
-                    
+
     print("Training complete!")
 
     if os.path.exists(best_model_path):
         model.load_state_dict(torch.load(best_model_path, map_location=device))
 
-    # Save the model
     torch.save(
         model.state_dict(),
         os.path.join(
             output_dir,
-            f"final_model-epoch={epoch:04}-best_val_loss={best_valid_loss:04}.pt"
-        )
+            f"final_model-epoch={epoch:04}-best_miou={best_miou:.4f}-best_val_loss={best_valid_loss:.4f}.pt",
+        ),
     )
     wandb.finish()
 
