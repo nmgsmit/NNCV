@@ -241,10 +241,15 @@ def main(args):
         weight_decay=args.weight_decay,
     )
 
-    max_iter = args.epochs * len(train_dataloader)
-    global_iter = 0
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=6,
+        threshold=1e-4,
+        verbose=True
+    )
 
-    # Training loop
     best_valid_loss = float('inf')
     best_dice = -float('inf')
     epochs_without_improvement = 0
@@ -255,44 +260,31 @@ def main(args):
         # Training
         model.train()
         for i, (images, labels) in enumerate(train_dataloader):
-
-            labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
+            labels = convert_to_train_id(labels)
             images, labels = images.to(device), labels.to(device)
-
-            labels = labels.long().squeeze(1)  # Remove channel dimension
-
-            current_lr = poly_lr(args.lr, global_iter, max_iter, args.poly_power)
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = current_lr
-
+            labels = labels.long().squeeze(1)
             optimizer.zero_grad()
             outputs = model(images)
-
             if isinstance(outputs, tuple):
                 main_logits, aux_logits = outputs
             else:
                 main_logits, aux_logits = outputs, None
-
             loss_main = ohem_criterion(main_logits, labels)
             loss_aux = ohem_criterion(aux_logits, labels) if aux_logits is not None else torch.tensor(0.0, device=device)
             loss_dice = dice_criterion(main_logits, labels)
             loss = loss_main + args.aux_weight * loss_aux + args.dice_weight * loss_dice
-
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite loss encountered; try lower lr or enable --skip-nonfinite-batches")
-
             loss.backward()
             optimizer.step()
             if ema_model is not None:
                 update_ema_model(ema_model, model, args.ema_decay)
-
             wandb.log({
                 "train_loss": loss.item(),
                 "learning_rate": optimizer.param_groups[0]['lr'],
                 "epoch": epoch + 1,
             }, step=epoch * len(train_dataloader) + i)
-            global_iter += 1
-            
+
         # Validation
         model.eval()
         eval_model = ema_model if ema_model is not None else model
@@ -301,41 +293,31 @@ def main(args):
             valid_losses_total = []
             valid_dice_scores = []
             for i, (images, labels) in enumerate(valid_dataloader):
-
-                labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
+                labels = convert_to_train_id(labels)
                 images, labels = images.to(device), labels.to(device)
-
-                labels = labels.long().squeeze(1)  # Remove channel dimension
-
+                labels = labels.long().squeeze(1)
                 outputs = eval_model(images)
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
-
                 loss_main = ohem_criterion(outputs, labels)
                 loss_dice = dice_criterion(outputs, labels)
                 loss_total = loss_main + args.dice_weight * loss_dice
                 valid_losses_total.append(loss_total.item())
                 valid_dice_scores.append((1.0 - loss_dice.item()))
-            
                 if i == 0:
                     predictions = outputs.softmax(1).argmax(1)
                     predictions = predictions.unsqueeze(1)
                     labels = labels.unsqueeze(1)
-
                     predictions = convert_train_id_to_color(predictions)
                     labels = convert_train_id_to_color(labels)
-
                     predictions_img = make_grid(predictions.cpu(), nrow=8)
                     labels_img = make_grid(labels.cpu(), nrow=8)
-
                     predictions_img = predictions_img.permute(1, 2, 0).numpy()
                     labels_img = labels_img.permute(1, 2, 0).numpy()
-
                     wandb.log({
                         "predictions": [wandb.Image(predictions_img)],
                         "labels": [wandb.Image(labels_img)],
                     }, step=(epoch + 1) * len(train_dataloader) - 1)
-            
             valid_loss = sum(valid_losses_total) / len(valid_losses_total)
             valid_mean_dice = sum(valid_dice_scores) / len(valid_dice_scores)
             wandb.log({
@@ -343,7 +325,7 @@ def main(args):
                 "valid_mean_dice": valid_mean_dice,
                 "epoch": epoch + 1,
             }, step=(epoch + 1) * len(train_dataloader) - 1)
-
+            scheduler.step(valid_loss)
             if valid_mean_dice > best_dice + args.early_stop_min_delta:
                 best_dice = valid_mean_dice
                 best_valid_loss = valid_loss
@@ -357,13 +339,9 @@ def main(args):
                 if epochs_without_improvement >= args.early_stop_patience:
                     print(f"Early stopping at epoch {epoch + 1}: no Dice improvement for {args.early_stop_patience} epochs.")
                     break
-        
     print("Training complete!")
-
     if os.path.exists(best_model_path):
         model.load_state_dict(torch.load(best_model_path, map_location=device))
-
-    # Save the model
     torch.save(
         model.state_dict(),
         os.path.join(
