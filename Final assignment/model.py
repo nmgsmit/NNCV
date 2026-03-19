@@ -5,6 +5,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+SEGFORMER_CONFIGS = {
+    "b0": {
+        "embed_dims": (32, 64, 160, 256),
+        "depths": (2, 2, 2, 2),
+        "sr_ratios": (8, 4, 2, 1),
+        "num_heads": (1, 2, 5, 8),
+        "decoder_embedding_dim": 256,
+        "drop_path_rate": 0.1,
+    },
+    "b5": {
+        "embed_dims": (64, 128, 320, 512),
+        "depths": (3, 6, 40, 3),
+        "sr_ratios": (8, 4, 2, 1),
+        "num_heads": (1, 2, 5, 8),
+        "decoder_embedding_dim": 768,
+        "drop_path_rate": 0.1,
+    },
+}
+
+
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
         super().__init__()
@@ -344,11 +364,32 @@ class Model(nn.Module):
             nn.Conv2d(embed_dims[2], n_classes, kernel_size=1),
         )
 
+    def _extract_checkpoint_state(self, checkpoint):
+        if not isinstance(checkpoint, dict):
+            raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)}")
+
+        for nested_key in ("state_dict", "model", "module"):
+            nested_state = checkpoint.get(nested_key)
+            if isinstance(nested_state, dict):
+                return nested_state
+        return checkpoint
+
     def _remap_pretrained_key(self, key):
-        if not key.startswith("segformer.encoder."):
+        if key.startswith("module."):
+            key = key[len("module."):]
+
+        valid_prefixes = (
+            "segformer.encoder.",
+            "encoder.",
+            "backbone.",
+            "segformer.backbone.",
+        )
+
+        source_prefix = next((prefix for prefix in valid_prefixes if key.startswith(prefix)), None)
+        if source_prefix is None:
             return None
 
-        key = key.replace("segformer.encoder.", "encoder.")
+        key = f"encoder.{key[len(source_prefix):]}"
 
         for stage_idx in range(4):
             key = key.replace(f"patch_embeddings.{stage_idx}.proj", f"stage{stage_idx + 1}.patch_embed.proj")
@@ -376,11 +417,12 @@ class Model(nn.Module):
             raise FileNotFoundError(f"Missing weights at {weight_path}")
 
         checkpoint = torch.load(weight_path, map_location="cpu")
+        checkpoint_state = self._extract_checkpoint_state(checkpoint)
         current_state = self.state_dict()
         remapped_state = {}
         kv_buffers = {}
 
-        for source_key, value in checkpoint.items():
+        for source_key, value in checkpoint_state.items():
             target_key = self._remap_pretrained_key(source_key)
             if target_key is None:
                 continue
@@ -427,9 +469,15 @@ class Model(nn.Module):
         print(f"Loaded {len(remapped_state)} pretrained tensors from {weight_path}")
         print(f"Pretrained encoder load result: {msg}")
         if missing_encoder_keys:
-            print("Encoder keys still randomly initialized:")
-            for key in missing_encoder_keys:
+            preview_count = min(10, len(missing_encoder_keys))
+            print(
+                f"Encoder keys still randomly initialized: {len(missing_encoder_keys)} "
+                f"(showing first {preview_count})"
+            )
+            for key in missing_encoder_keys[:preview_count]:
                 print(f"  - {key}")
+            if len(missing_encoder_keys) > preview_count:
+                print("  - ...")
 
     def forward(self, x):
         input_size = x.shape[-2:]
@@ -444,3 +492,13 @@ class Model(nn.Module):
         if self.training:
             return main_logits, aux_logits
         return main_logits
+
+
+def build_model(variant="b0", **overrides):
+    if variant not in SEGFORMER_CONFIGS:
+        available = ", ".join(sorted(SEGFORMER_CONFIGS))
+        raise ValueError(f"Unknown SegFormer variant '{variant}'. Available variants: {available}")
+
+    config = dict(SEGFORMER_CONFIGS[variant])
+    config.update(overrides)
+    return Model(**config)

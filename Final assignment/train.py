@@ -19,7 +19,7 @@ from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F_v2
 from torchvision.utils import make_grid
 
-from model import Model
+from model import SEGFORMER_CONFIGS, build_model
 
 
 IGNORE_INDEX = 255
@@ -309,9 +309,21 @@ def compute_mean_dice(confmat):
 
 
 def get_args_parser():
-    parser = ArgumentParser("Training script for SegFormer-B5 on Cityscapes")
+    parser = ArgumentParser("Training script for SegFormer on Cityscapes")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
-    parser.add_argument("--pretrained-path", type=str, default="./mit-b5", help="Path to mit-b5 pretrained weights folder")
+    parser.add_argument(
+        "--model-variant",
+        type=str,
+        default="b0",
+        choices=sorted(SEGFORMER_CONFIGS),
+        help="SegFormer backbone preset to use",
+    )
+    parser.add_argument(
+        "--pretrained-path",
+        type=str,
+        default=None,
+        help="Path to pretrained weights folder; defaults to ./mit-<model-variant>",
+    )
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd", "adamw"], help="Optimizer type")
     parser.add_argument("--batch-size", type=int, default=16, help="Training batch size")
     parser.add_argument("--base-batch-size", type=int, default=16, help="Reference batch size used for LR scaling")
@@ -336,19 +348,33 @@ def get_args_parser():
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for evaluation model (<=0 disables EMA)")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--experiment-id", type=str, default="efficient SegFormer-B5", help="Experiment ID for Weights & Biases")
+    parser.add_argument(
+        "--experiment-id",
+        type=str,
+        default=None,
+        help="Experiment ID for Weights & Biases; defaults to segformer-<model-variant>",
+    )
     parser.add_argument("--dropout", type=float, default=0.1, help="Decoder dropout rate for SegFormer")
     return parser
 
 
+def resolve_pretrained_path(args):
+    if args.pretrained_path is not None:
+        return args.pretrained_path
+    return f"./mit-{args.model_variant}"
+
+
 def main(args):
+    pretrained_path = resolve_pretrained_path(args)
+    experiment_id = args.experiment_id or f"segformer-{args.model_variant}"
+
     wandb.init(
         project="5lsm0-cityscapes-segmentation",
-        name=args.experiment_id,
+        name=experiment_id,
         config=vars(args),
     )
 
-    output_dir = os.path.join("checkpoints", args.experiment_id)
+    output_dir = os.path.join("checkpoints", experiment_id)
     os.makedirs(output_dir, exist_ok=True)
 
     torch.manual_seed(args.seed)
@@ -397,18 +423,15 @@ def main(args):
         worker_init_fn=seed_worker,
     )
 
-    model = Model(
+    model = build_model(
+        variant=args.model_variant,
         in_channels=3,
         n_classes=19,
-        embed_dims=(64, 128, 320, 512),
-        depths=(3, 6, 40, 3),
-        sr_ratios=(8, 4, 2, 1),
-        num_heads=(1, 2, 5, 8),
         dropout=args.dropout,
     ).to(device)
 
     try:
-        model.load_pretrained(args.pretrained_path)
+        model.load_pretrained(pretrained_path)
     except Exception as e:
         print(f"Warning: Could not load pretrained weights. {e}")
         print("Training from scratch...")
