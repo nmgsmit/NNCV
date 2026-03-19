@@ -237,28 +237,41 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-    # Define the transforms to apply to the data (with more augmentation)
-    img_transforms = []
-    img_transforms.append(ToImage())
-    if args.random_crop > 0:
-        img_transforms.append(torchvision.transforms.RandomCrop(args.random_crop, pad_if_needed=True))
-    img_transforms.append(Resize((256, 256)))
+    img_transforms = [
+        ToImage(),
+        torchvision.transforms.RandomResizedCrop(
+            size=(512, 1024),
+            scale=(0.5, 2.0),
+            ratio=(1.5, 2.0)
+        ),
+    ]
+
     if args.color_jitter > 0:
-        img_transforms.append(torchvision.transforms.ColorJitter(brightness=args.color_jitter, contrast=args.color_jitter, saturation=args.color_jitter, hue=min(0.1, args.color_jitter)))
-    img_transforms.append(ToDtype(torch.float32, scale=True))
-    img_transforms.append(Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)))
-    if args.gaussian_blur > 0:
-        img_transforms.append(torchvision.transforms.RandomApply([torchvision.transforms.GaussianBlur(3)], p=args.gaussian_blur))
+        img_transforms.append(torchvision.transforms.ColorJitter(
+            brightness=args.color_jitter,
+            contrast=args.color_jitter,
+            saturation=args.color_jitter,
+            hue=min(0.1, args.color_jitter)
+        ))
+
+    img_transforms += [
+        ToDtype(torch.float32, scale=True),
+        Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ]
+
     img_transform = Compose(img_transforms)
 
-    # Target transform (mask)
-    target_transforms = []
-    target_transforms.append(ToImage())
-    if args.random_crop > 0:
-        target_transforms.append(torchvision.transforms.RandomCrop(args.random_crop, pad_if_needed=True))
-    target_transforms.append(Resize((256, 256), interpolation=InterpolationMode.NEAREST))
-    target_transforms.append(ToDtype(torch.int64))  # no scaling
-    target_transform = Compose(target_transforms)
+
+    target_transform = Compose([
+        ToImage(),
+        torchvision.transforms.RandomResizedCrop(
+            size=(512, 1024),
+            scale=(0.5, 2.0),
+            ratio=(1.5, 2.0),
+            interpolation=InterpolationMode.NEAREST
+        ),
+        ToDtype(torch.int64),
+    ])
 
     # Load the dataset and make a split for training and validation
     train_base_dataset = Cityscapes(
@@ -281,11 +294,14 @@ def main(args):
     )
 
     train_dataloader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True,
-        num_workers=args.num_workers
-    )
+	train_dataset,
+	batch_size=args.batch_size,
+	shuffle=True,
+	num_workers=args.num_workers,
+	pin_memory=True,
+	drop_last=True
+    )   
+
     valid_dataloader = DataLoader(
         valid_dataset, 
         batch_size=args.batch_size, 
@@ -375,13 +391,28 @@ def main(args):
             loss_main = ohem_criterion(main_logits, labels)
             loss_aux = ohem_criterion(aux_logits, labels) if aux_logits is not None else torch.tensor(0.0, device=device)
             loss_dice = dice_criterion(main_logits, labels)
-            loss = loss_main + args.aux_weight * loss_aux + args.dice_weight * loss_dice
-
+            loss = loss_main + 0.4 * loss_aux + 0.5 * loss_dice
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite loss encountered; try lower lr or enable --skip-nonfinite-batches")
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
+            current_lr = poly_lr(
+                base_lr=effective_base_lr,
+                current_iter=global_iter,
+                max_iter=args.epochs * len(train_dataloader),
+                warmup_iters=args.warmup_iters,
+                power=args.poly_power,
+                min_lr_ratio=args.min_lr_ratio,
+            )
+
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+
+
+            
             if ema_model is not None:
                 update_ema_model(ema_model, model, args.ema_decay)
 
