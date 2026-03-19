@@ -215,3 +215,5 @@ class SegHead(nn.Module):
 
 	def forward(self, x):
 		return self.block(x)
+
+		return self.block(x)
