@@ -277,8 +277,7 @@ def main(args):
                 raise RuntimeError("Non-finite loss encountered; try lower lr or enable --skip-nonfinite-batches")
             loss.backward()
             optimizer.step()
-            if ema_model is not None:
-                update_ema_model(ema_model, model, args.ema_decay)
+
             wandb.log({
                 "train_loss": loss.item(),
                 "learning_rate": optimizer.param_groups[0]['lr'],
@@ -287,8 +286,7 @@ def main(args):
 
         # Validation
         model.eval()
-        eval_model = ema_model if ema_model is not None else model
-        eval_model.eval()
+
         with torch.no_grad():
             valid_losses_total = []
             valid_dice_scores = []
@@ -296,7 +294,7 @@ def main(args):
                 labels = convert_to_train_id(labels)
                 images, labels = images.to(device), labels.to(device)
                 labels = labels.long().squeeze(1)
-                outputs = eval_model(images)
+                outputs = model(images)
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
                 loss_main = ohem_criterion(outputs, labels)
@@ -329,10 +327,8 @@ def main(args):
             if valid_mean_dice > best_dice + args.early_stop_min_delta:
                 best_dice = valid_mean_dice
                 best_valid_loss = valid_loss
-                if ema_model is not None:
-                    torch.save(ema_model.state_dict(), best_model_path)
-                else:
-                    torch.save(model.state_dict(), best_model_path)
+              
+                torch.save(model.state_dict(), best_model_path)
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
