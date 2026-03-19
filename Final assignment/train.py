@@ -293,6 +293,21 @@ def compute_mean_iou(confmat):
     return iou.mean().item()
 
 
+def compute_mean_dice(confmat):
+    confmat = confmat.float()
+    true_positives = torch.diag(confmat)
+    false_positives = confmat.sum(dim=0) - true_positives
+    false_negatives = confmat.sum(dim=1) - true_positives
+
+    denominator = 2.0 * true_positives + false_positives + false_negatives
+    valid = denominator > 0
+    if not valid.any():
+        return 0.0
+
+    dice = (2.0 * true_positives[valid]) / denominator[valid]
+    return dice.mean().item()
+
+
 def get_args_parser():
     parser = ArgumentParser("Training script for SegFormer-B5 on Cityscapes")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
@@ -504,7 +519,6 @@ def main(args):
 
         with torch.no_grad():
             valid_losses_total = []
-            valid_dice_scores = []
             confmat = torch.zeros((19, 19), dtype=torch.int64, device=device)
 
             for i, (images, labels) in enumerate(valid_dataloader):
@@ -521,7 +535,6 @@ def main(args):
                 loss_total = loss_main + args.dice_weight * loss_dice
 
                 valid_losses_total.append(loss_total.item())
-                valid_dice_scores.append(1.0 - loss_dice.item())
                 update_confusion_matrix(confmat, outputs, labels, num_classes=19)
 
                 if i == 0:
@@ -541,7 +554,7 @@ def main(args):
                     )
 
             valid_loss = sum(valid_losses_total) / len(valid_losses_total)
-            valid_mean_dice = sum(valid_dice_scores) / len(valid_dice_scores)
+            valid_mean_dice = compute_mean_dice(confmat)
             valid_miou = compute_mean_iou(confmat)
             train_loss = train_loss_total / len(train_dataloader)
 
