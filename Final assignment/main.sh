@@ -11,11 +11,11 @@ python3 train.py \
     --data-dir ./data/cityscapes \
     --pretrained-path ./mit-b5 \
     --optimizer adamw \
-    --batch-size 4 \
+    --batch-size 8 \
     --base-batch-size 16 \
     --scale-lr-with-batch \
     --epochs 80 \
-    --lr 1e-4 \
+    --lr 1e-3 \
     --weight-decay 0.01 \
     --warmup-iters 1500 \
     --poly-power 1.0 \
