@@ -33,6 +33,22 @@ train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cl
 train_id_to_color[IGNORE_INDEX] = (0, 0, 0)
 
 
+def _as_tensor_image(image) -> torch.Tensor:
+    if isinstance(image, torch.Tensor):
+        return image
+    return TF.pil_to_tensor(image)
+
+
+def _as_float_image(image) -> torch.Tensor:
+    image = _as_tensor_image(image)
+    return image.float().div_(255.0)
+
+
+def _as_long_target(target) -> torch.Tensor:
+    target = _as_tensor_image(target)
+    return target.to(dtype=torch.int64)
+
+
 def convert_to_train_id(label_img: torch.Tensor) -> torch.Tensor:
     return label_img.apply_(lambda x: id_to_trainid[x])
 
@@ -108,7 +124,7 @@ class CityscapesJointTransform:
                 image = TF.hflip(image)
                 target = TF.hflip(target)
 
-            image = TF.to_image(image)
+            image = _as_tensor_image(image)
             if self.color_jitter is not None:
                 image = self.color_jitter(image)
             if self.gaussian_blur > 0.0 and random.random() < self.gaussian_blur:
@@ -125,13 +141,12 @@ class CityscapesJointTransform:
                 self.image_size,
                 interpolation=InterpolationMode.NEAREST,
             )
-            image = TF.to_image(image)
+            image = _as_tensor_image(image)
 
-        image = TF.to_dtype(image, torch.float32, scale=True)
+        image = _as_float_image(image)
         image = TF.normalize(image, mean=CITYSCAPES_MEAN, std=CITYSCAPES_STD)
 
-        target = TF.to_image(target)
-        target = TF.to_dtype(target, torch.int64, scale=False)
+        target = _as_long_target(target)
         return image, target
 
 
