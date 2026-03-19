@@ -12,7 +12,7 @@ python3 train.py \
     --pretrained-path ./mit-b5 \
     --optimizer adamw \
     --batch-size 8 \
-    --base-batch-size 16 \
+    --base-batch-size 4 \
     --scale-lr-with-batch \
     --epochs 80 \
     --lr 1e-3 \

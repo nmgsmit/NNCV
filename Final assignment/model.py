@@ -1,11 +1,10 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
 
-# ---------------------------
-# DropPath (stochastic depth)
-# ---------------------------
+
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
         super().__init__()
@@ -21,46 +20,52 @@ class DropPath(nn.Module):
         return x.div(keep_prob) * random_tensor
 
 
-# ---------------------------
-# Encoder Components
-# ---------------------------
 class OverlapPatchEmbed(nn.Module):
     def __init__(self, in_channels, embed_dim, patch_size, stride):
         super().__init__()
-        self.proj = nn.Conv2d(in_channels, embed_dim, patch_size, stride, padding=patch_size // 2)
+        self.proj = nn.Conv2d(
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=stride,
+            padding=patch_size // 2,
+        )
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
         x = self.proj(x)
-        b, c, h, w = x.shape
+        _, _, h, w = x.shape
         x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x, h, w
 
+
 class EfficientSelfAttention(nn.Module):
     def __init__(self, dim, num_heads=1, sr_ratio=1, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
         self.q = nn.Linear(dim, dim)
         self.kv = nn.Linear(dim, dim * 2)
-
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.sr_ratio = sr_ratio
         if sr_ratio > 1:
-            self.sr = nn.Conv2d(dim, dim, sr_ratio, sr_ratio)
+            self.sr = nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio)
             self.norm = nn.LayerNorm(dim)
         else:
             self.sr = None
+            self.norm = None
 
     def forward(self, x, h, w):
         b, n, c = x.shape
-
         q = self.q(x).reshape(b, n, self.num_heads, c // self.num_heads).permute(0, 2, 1, 3)
 
         if self.sr is not None:
@@ -80,21 +85,21 @@ class EfficientSelfAttention(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(b, n, c)
         x = self.proj(x)
         x = self.proj_drop(x)
-
         return x
+
 
 class MixFFN(nn.Module):
     def __init__(self, dim, hidden_dim, drop=0.0):
         super().__init__()
         self.fc1 = nn.Linear(dim, hidden_dim)
-        self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1, groups=hidden_dim)
+        self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1, groups=hidden_dim)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_dim, dim)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x, h, w):
         x = self.fc1(x)
-        b, n, c = x.shape
+        b, _, c = x.shape
         x = x.transpose(1, 2).reshape(b, c, h, w)
         x = self.dwconv(x)
         x = x.flatten(2).transpose(1, 2)
@@ -104,34 +109,69 @@ class MixFFN(nn.Module):
         x = self.drop(x)
         return x
 
+
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4.0, sr_ratio=1, drop=0.0, drop_path=0.1):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        sr_ratio=1,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        mlp_drop=0.0,
+        drop_path=0.0,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = EfficientSelfAttention(dim, num_heads, sr_ratio, drop, drop)
-
+        self.attn = EfficientSelfAttention(
+            dim,
+            num_heads=num_heads,
+            sr_ratio=sr_ratio,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
         self.drop_path = DropPath(drop_path)
-
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MixFFN(dim, int(dim * mlp_ratio), drop)
+        self.mlp = MixFFN(dim, int(dim * mlp_ratio), drop=mlp_drop)
 
     def forward(self, x, h, w):
         x = x + self.drop_path(self.attn(self.norm1(x), h, w))
         x = x + self.drop_path(self.mlp(self.norm2(x), h, w))
         return x
 
+
 class MixVisionStage(nn.Module):
-    def __init__(self, in_channels, embed_dim, depth, num_heads, sr_ratio, patch_size, stride, drop_rate):
+    def __init__(
+        self,
+        in_channels,
+        embed_dim,
+        depth,
+        num_heads,
+        sr_ratio,
+        patch_size,
+        stride,
+        drop_path_rates,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        mlp_drop=0.0,
+    ):
         super().__init__()
-
         self.patch_embed = OverlapPatchEmbed(in_channels, embed_dim, patch_size, stride)
-
-        dpr = torch.linspace(0, 0.1, depth).tolist()
-        self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, sr_ratio=sr_ratio, drop=drop_rate, drop_path=dpr[i])
-            for i in range(depth)
-        ])
-
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    embed_dim,
+                    num_heads=num_heads,
+                    sr_ratio=sr_ratio,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                    mlp_drop=mlp_drop,
+                    drop_path=drop_path_rates[i],
+                )
+                for i in range(depth)
+            ]
+        )
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
@@ -139,17 +179,86 @@ class MixVisionStage(nn.Module):
         for blk in self.blocks:
             x = blk(x, h, w)
         x = self.norm(x)
-        b, n, c = x.shape
+        b, _, c = x.shape
         return x.transpose(1, 2).reshape(b, c, h, w)
 
+
 class MixVisionTransformerEncoder(nn.Module):
-    def __init__(self, in_channels, embed_dims, depths, num_heads, sr_ratios, drop_rate=0.1):
+    def __init__(
+        self,
+        in_channels,
+        embed_dims,
+        depths,
+        num_heads,
+        sr_ratios,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        mlp_drop=0.0,
+        drop_path_rate=0.1,
+    ):
         super().__init__()
 
-        self.stage1 = MixVisionStage(in_channels, embed_dims[0], depths[0], num_heads[0], sr_ratios[0], 7, 4, drop_rate)
-        self.stage2 = MixVisionStage(embed_dims[0], embed_dims[1], depths[1], num_heads[1], sr_ratios[1], 3, 2, drop_rate)
-        self.stage3 = MixVisionStage(embed_dims[1], embed_dims[2], depths[2], num_heads[2], sr_ratios[2], 3, 2, drop_rate)
-        self.stage4 = MixVisionStage(embed_dims[2], embed_dims[3], depths[3], num_heads[3], sr_ratios[3], 3, 2, drop_rate)
+        total_depth = sum(depths)
+        drop_path_rates = torch.linspace(0, drop_path_rate, total_depth).tolist()
+
+        stage_slices = []
+        start = 0
+        for depth in depths:
+            stage_slices.append(drop_path_rates[start:start + depth])
+            start += depth
+
+        self.stage1 = MixVisionStage(
+            in_channels,
+            embed_dims[0],
+            depths[0],
+            num_heads[0],
+            sr_ratios[0],
+            patch_size=7,
+            stride=4,
+            drop_path_rates=stage_slices[0],
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            mlp_drop=mlp_drop,
+        )
+        self.stage2 = MixVisionStage(
+            embed_dims[0],
+            embed_dims[1],
+            depths[1],
+            num_heads[1],
+            sr_ratios[1],
+            patch_size=3,
+            stride=2,
+            drop_path_rates=stage_slices[1],
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            mlp_drop=mlp_drop,
+        )
+        self.stage3 = MixVisionStage(
+            embed_dims[1],
+            embed_dims[2],
+            depths[2],
+            num_heads[2],
+            sr_ratios[2],
+            patch_size=3,
+            stride=2,
+            drop_path_rates=stage_slices[2],
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            mlp_drop=mlp_drop,
+        )
+        self.stage4 = MixVisionStage(
+            embed_dims[2],
+            embed_dims[3],
+            depths[3],
+            num_heads[3],
+            sr_ratios[3],
+            patch_size=3,
+            stride=2,
+            drop_path_rates=stage_slices[3],
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            mlp_drop=mlp_drop,
+        )
 
     def forward(self, x):
         c1 = self.stage1(x)
@@ -159,21 +268,22 @@ class MixVisionTransformerEncoder(nn.Module):
         return c1, c2, c3, c4
 
 
-# ---------------------------
-# Decoder
-# ---------------------------
 class SegFormerHead(nn.Module):
     def __init__(self, in_channels, embedding_dim, n_classes, dropout=0.1):
         super().__init__()
 
-        self.linear_c1 = nn.Conv2d(in_channels[0], embedding_dim, 1)
-        self.linear_c2 = nn.Conv2d(in_channels[1], embedding_dim, 1)
-        self.linear_c3 = nn.Conv2d(in_channels[2], embedding_dim, 1)
-        self.linear_c4 = nn.Conv2d(in_channels[3], embedding_dim, 1)
+        self.linear_c1 = nn.Conv2d(in_channels[0], embedding_dim, kernel_size=1)
+        self.linear_c2 = nn.Conv2d(in_channels[1], embedding_dim, kernel_size=1)
+        self.linear_c3 = nn.Conv2d(in_channels[2], embedding_dim, kernel_size=1)
+        self.linear_c4 = nn.Conv2d(in_channels[3], embedding_dim, kernel_size=1)
 
-        self.linear_fuse = nn.Conv2d(embedding_dim * 4, embedding_dim, 1)
+        self.linear_fuse = nn.Sequential(
+            nn.Conv2d(embedding_dim * 4, embedding_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(embedding_dim),
+            nn.ReLU(inplace=True),
+        )
         self.dropout = nn.Dropout2d(dropout)
-        self.classifier = nn.Conv2d(embedding_dim, n_classes, 1)
+        self.classifier = nn.Conv2d(embedding_dim, n_classes, kernel_size=1)
 
     def forward(self, features):
         c1, c2, c3, c4 = features
@@ -187,26 +297,37 @@ class SegFormerHead(nn.Module):
         x = torch.cat([c1, c2, c3, c4], dim=1)
         x = self.linear_fuse(x)
         x = self.dropout(x)
-        x = self.classifier(x)
-
-        return x
+        return self.classifier(x)
 
 
-# ---------------------------
-# Main Model Wrapper
-# ---------------------------
 class Model(nn.Module):
-    def __init__(self, in_channels=3, n_classes=19,
-                 embed_dims=(64, 128, 320, 512),
-                 depths=(3, 6, 40, 3),
-                 sr_ratios=(8, 4, 2, 1),
-                 num_heads=(1, 2, 5, 8),
-                 decoder_embedding_dim=768,
-                 dropout=0.1):
+    def __init__(
+        self,
+        in_channels=3,
+        n_classes=19,
+        embed_dims=(64, 128, 320, 512),
+        depths=(3, 6, 40, 3),
+        sr_ratios=(8, 4, 2, 1),
+        num_heads=(1, 2, 5, 8),
+        decoder_embedding_dim=768,
+        dropout=0.1,
+        attn_drop=0.0,
+        mlp_drop=0.0,
+        proj_drop=0.0,
+        drop_path_rate=0.1,
+    ):
         super().__init__()
 
         self.encoder = MixVisionTransformerEncoder(
-            in_channels, embed_dims, depths, num_heads, sr_ratios, drop_rate=dropout
+            in_channels=in_channels,
+            embed_dims=embed_dims,
+            depths=depths,
+            num_heads=num_heads,
+            sr_ratios=sr_ratios,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            mlp_drop=mlp_drop,
+            drop_path_rate=drop_path_rate,
         )
 
         self.decode_head = SegFormerHead(
@@ -217,98 +338,98 @@ class Model(nn.Module):
         )
 
         self.aux_head = nn.Sequential(
-            nn.Conv2d(embed_dims[2], embed_dims[2], 3, padding=1, bias=False),
+            nn.Conv2d(embed_dims[2], embed_dims[2], kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(embed_dims[2]),
             nn.ReLU(inplace=True),
-            nn.Conv2d(embed_dims[2], n_classes, 1)
+            nn.Conv2d(embed_dims[2], n_classes, kernel_size=1),
         )
 
+    def _remap_pretrained_key(self, key):
+        if not key.startswith("segformer.encoder."):
+            return None
+
+        key = key.replace("segformer.encoder.", "encoder.")
+
+        for stage_idx in range(4):
+            key = key.replace(f"patch_embeddings.{stage_idx}.proj", f"stage{stage_idx + 1}.patch_embed.proj")
+            key = key.replace(
+                f"patch_embeddings.{stage_idx}.layer_norm",
+                f"stage{stage_idx + 1}.patch_embed.norm",
+            )
+            key = key.replace(f"layer_norm.{stage_idx}", f"stage{stage_idx + 1}.norm")
+            key = key.replace(f"block.{stage_idx}", f"stage{stage_idx + 1}.blocks")
+
+        key = key.replace(".layer_norm_1", ".norm1")
+        key = key.replace(".layer_norm_2", ".norm2")
+        key = key.replace(".attention.self.query", ".attn.q")
+        key = key.replace(".attention.self.sr", ".attn.sr")
+        key = key.replace(".attention.self.layer_norm", ".attn.norm")
+        key = key.replace(".attention.output.dense", ".attn.proj")
+        key = key.replace(".mlp.dense1", ".mlp.fc1")
+        key = key.replace(".mlp.dwconv.dwconv", ".mlp.dwconv")
+        key = key.replace(".mlp.dense2", ".mlp.fc2")
+        return key
+
     def load_pretrained(self, folder_path):
-        """Loads weights from HuggingFace local folder and adapts kv weights if needed."""
         weight_path = os.path.join(folder_path, "pytorch_model.bin")
         if not os.path.exists(weight_path):
             raise FileNotFoundError(f"Missing weights at {weight_path}")
 
-        state_dict = torch.load(weight_path, map_location="cpu")
-        new_state_dict = {}
+        checkpoint = torch.load(weight_path, map_location="cpu")
+        current_state = self.state_dict()
+        remapped_state = {}
+        kv_buffers = {}
 
-        # Temporary storage for key/value weights to be concatenated
-        kv_weight_buffers = {}
-        kv_bias_buffers = {}
-
-        for key, value in state_dict.items():
-            if not key.startswith("segformer.encoder"):
+        for source_key, value in checkpoint.items():
+            target_key = self._remap_pretrained_key(source_key)
+            if target_key is None:
                 continue
 
-            k = key.replace("segformer.encoder.", "encoder.")
-
-            # Map Stages/Patch Embeddings
-            k = k.replace("patch_embeddings.0", "stage1.patch_embed")
-            k = k.replace("patch_embeddings.1", "stage2.patch_embed")
-            k = k.replace("patch_embeddings.2", "stage3.patch_embed")
-            k = k.replace("patch_embeddings.3", "stage4.patch_embed")
-
-            # Map Layer Norms
-            k = k.replace("layer_norm.0", "stage1.norm")
-            k = k.replace("layer_norm.1", "stage2.norm")
-            k = k.replace("layer_norm.2", "stage3.norm")
-            k = k.replace("layer_norm.3", "stage4.norm")
-
-            # Map Blocks
-            k = k.replace("block.0", "stage1.blocks")
-            k = k.replace("block.1", "stage2.blocks")
-            k = k.replace("block.2", "stage3.blocks")
-            k = k.replace("block.3", "stage4.blocks")
-
-            # Map Attention sub-keys
-            if ".attention.self.key.weight" in key:
-                # Buffer for later concat
-                kv_weight_buffers[k.replace(".attention.self.key.weight", ".attn.kv.weight")] = value
+            if source_key.endswith(".attention.self.key.weight"):
+                fused_key = target_key.replace(".attn.q.weight", ".attn.kv.weight").replace(
+                    ".attention.self.key.weight",
+                    ".attn.kv.weight",
+                )
+                kv_buffers.setdefault(fused_key, {})["key"] = value
                 continue
-            if ".attention.self.value.weight" in key:
-                # Buffer for later concat
-                kv_weight_buffers[k.replace(".attention.self.value.weight", ".attn.kv.weight")] = (
-                    kv_weight_buffers.get(k.replace(".attention.self.value.weight", ".attn.kv.weight")), value)
+            if source_key.endswith(".attention.self.value.weight"):
+                fused_key = target_key.replace(".attention.self.value.weight", ".attn.kv.weight")
+                kv_buffers.setdefault(fused_key, {})["value"] = value
                 continue
-            if ".attention.self.key.bias" in key:
-                kv_bias_buffers[k.replace(".attention.self.key.bias", ".attn.kv.bias")] = value
+            if source_key.endswith(".attention.self.key.bias"):
+                fused_key = target_key.replace(".attn.q.bias", ".attn.kv.bias").replace(
+                    ".attention.self.key.bias",
+                    ".attn.kv.bias",
+                )
+                kv_buffers.setdefault(fused_key, {})["key"] = value
                 continue
-            if ".attention.self.value.bias" in key:
-                kv_bias_buffers[k.replace(".attention.self.value.bias", ".attn.kv.bias")] = (
-                    kv_bias_buffers.get(k.replace(".attention.self.value.bias", ".attn.kv.bias")), value)
+            if source_key.endswith(".attention.self.value.bias"):
+                fused_key = target_key.replace(".attention.self.value.bias", ".attn.kv.bias")
+                kv_buffers.setdefault(fused_key, {})["value"] = value
                 continue
 
-            k = k.replace(".attention.self.query", ".attn.q")
-            k = k.replace(".attention.output.dense", ".attn.proj")
+            if target_key in current_state and current_state[target_key].shape == value.shape:
+                remapped_state[target_key] = value
 
-            # Map FFN/MLP sub-keys
-            k = k.replace(".mlp.dense1", ".mlp.fc1")
-            k = k.replace(".mlp.dwconv.dwconv", ".mlp.dwconv")
-            k = k.replace(".mlp.dense2", ".mlp.fc2")
-
-            if k in self.state_dict():
-                new_state_dict[k] = value
-
-        # Now handle kv weights/biases that need concatenation
-        for k, v in kv_weight_buffers.items():
-            if isinstance(v, tuple):
-                # (key_weight, value_weight)
-                key_weight, value_weight = v
-                if key_weight is not None and value_weight is not None:
-                    new_state_dict[k] = torch.cat([key_weight, value_weight], dim=0)
-            else:
-                # Only one present, skip
+        for fused_key, pieces in kv_buffers.items():
+            if "key" not in pieces or "value" not in pieces:
                 continue
-        for k, v in kv_bias_buffers.items():
-            if isinstance(v, tuple):
-                key_bias, value_bias = v
-                if key_bias is not None and value_bias is not None:
-                    new_state_dict[k] = torch.cat([key_bias, value_bias], dim=0)
-            else:
-                continue
+            fused_value = torch.cat([pieces["key"], pieces["value"]], dim=0)
+            if fused_key in current_state and current_state[fused_key].shape == fused_value.shape:
+                remapped_state[fused_key] = fused_value
 
-        msg = self.load_state_dict(new_state_dict, strict=False)
-        print(f"Pretrained encoder loaded: {msg}")
+        missing_encoder_keys = sorted(
+            key for key in current_state.keys()
+            if key.startswith("encoder.") and key not in remapped_state
+        )
+
+        msg = self.load_state_dict(remapped_state, strict=False)
+        print(f"Loaded {len(remapped_state)} pretrained tensors from {weight_path}")
+        print(f"Pretrained encoder load result: {msg}")
+        if missing_encoder_keys:
+            print("Encoder keys still randomly initialized:")
+            for key in missing_encoder_keys:
+                print(f"  - {key}")
 
     def forward(self, x):
         input_size = x.shape[-2:]
