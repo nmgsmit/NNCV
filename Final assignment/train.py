@@ -184,6 +184,7 @@ def get_args_parser():
 
     parser = ArgumentParser("Training script for a PyTorch U-Net model")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
+    parser.add_argument("--pretrained-path", type=str, default="./mit-b5", help="Path to mit-b5 pretrained weights folder")
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd", "adamw"], help="Optimizer type")
     parser.add_argument("--batch-size", type=int, default=16, help="Training batch size")
     parser.add_argument("--base-batch-size", type=int, default=16, help="Reference batch size used for LR scaling")
@@ -209,7 +210,7 @@ def get_args_parser():
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for evaluation model (<=0 disables EMA)")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--experiment-id", type=str, default="efficient DDRNET-23-slim", help="Experiment ID for Weights & Biases")
+    parser.add_argument("--experiment-id", type=str, default="efficient SegFormer-B5", help="Experiment ID for Weights & Biases")
 
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for all dropout layers in SegFormer")
     return parser
@@ -228,14 +229,11 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
 
     # Set seed for reproducability
-    # If you add other sources of randomness (NumPy, Random), 
-    # make sure to set their seeds as well
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
 
     # Define the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
     img_transforms = [
         ToImage(),
@@ -261,7 +259,6 @@ def main(args):
 
     img_transform = Compose(img_transforms)
 
-
     target_transform = Compose([
         ToImage(),
         torchvision.transforms.RandomResizedCrop(
@@ -275,12 +272,12 @@ def main(args):
 
     # Load the dataset and make a split for training and validation
     train_base_dataset = Cityscapes(
-    args.data_dir,
-    split="train",
-    mode="fine",
-    target_type="semantic",
-    transform=img_transform,
-    target_transform=target_transform,
+        args.data_dir,
+        split="train",
+        mode="fine",
+        target_type="semantic",
+        transform=img_transform,
+        target_transform=target_transform,
     )
     train_dataset = AugmentedCityscapes(train_base_dataset, hflip_prob=args.hflip_prob)
 
@@ -294,12 +291,12 @@ def main(args):
     )
 
     train_dataloader = DataLoader(
-	train_dataset,
-	batch_size=args.batch_size,
-	shuffle=True,
-	num_workers=args.num_workers,
-	pin_memory=True,
-	drop_last=True
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True
     )   
 
     valid_dataloader = DataLoader(
@@ -309,12 +306,26 @@ def main(args):
         num_workers=args.num_workers
     )
 
-    # Define the model
+    # Define the model with mit-b5 parameters
     model = Model(
-        in_channels=3,  # RGB images
-        n_classes=19,  # 19 classes in the Cityscapes dataset
+        in_channels=3,
+        n_classes=19,
+        embed_dims=(64, 128, 320, 512), # B5 params
+        depths=(3, 6, 40, 3),           # B5 params
+        sr_ratios=(8, 4, 2, 1),
+        num_heads=(1, 2, 5, 8),
         dropout=args.dropout
-    ).to(device)
+    )
+    
+    # Load Pretrained Weights
+    try:
+        model.load_pretrained(args.pretrained_path)
+    except Exception as e:
+        print(f"Warning: Could not load pretrained weights. {e}")
+        print("Training from scratch...")
+        
+    model = model.to(device)
+
     ema_model = None
     if args.ema_decay > 0.0:
         ema_model = copy.deepcopy(model).to(device)
@@ -370,6 +381,7 @@ def main(args):
     best_dice = -float('inf')
     epochs_without_improvement = 0
     best_model_path = os.path.join(output_dir, "best_model.pt")
+    
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1:04}/{args.epochs:04}")
 
@@ -392,6 +404,7 @@ def main(args):
             loss_aux = ohem_criterion(aux_logits, labels) if aux_logits is not None else torch.tensor(0.0, device=device)
             loss_dice = dice_criterion(main_logits, labels)
             loss = loss_main + 0.4 * loss_aux + 0.5 * loss_dice
+            
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite loss encountered; try lower lr or enable --skip-nonfinite-batches")
 
@@ -411,8 +424,6 @@ def main(args):
             for param_group in optimizer.param_groups:
                 param_group['lr'] = current_lr
 
-
-            
             if ema_model is not None:
                 update_ema_model(ema_model, model, args.ema_decay)
 
@@ -427,21 +438,28 @@ def main(args):
         model.eval()
         eval_model = ema_model if ema_model is not None else model
         eval_model.eval()
+        
         with torch.no_grad():
             valid_losses_total = []
             valid_dice_scores = []
+            
             for i, (images, labels) in enumerate(valid_dataloader):
                 labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
                 images, labels = images.to(device), labels.to(device)
                 labels = labels.long().squeeze(1)  # Remove channel dimension
+                
                 outputs = eval_model(images)
+                
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
+                    
                 loss_main = ohem_criterion(outputs, labels)
                 loss_dice = dice_criterion(outputs, labels)
                 loss_total = loss_main + args.dice_weight * loss_dice
+                
                 valid_losses_total.append(loss_total.item())
                 valid_dice_scores.append((1.0 - loss_dice.item()))
+                
                 if i == 0:
                     predictions = outputs.softmax(1).argmax(1)
                     predictions = predictions.unsqueeze(1)
@@ -452,12 +470,15 @@ def main(args):
                     labels_img = make_grid(labels.cpu(), nrow=8)
                     predictions_img = predictions_img.permute(1, 2, 0).numpy()
                     labels_img = labels_img.permute(1, 2, 0).numpy()
+                    
                     wandb.log({
                         "predictions": [wandb.Image(predictions_img)],
                         "labels": [wandb.Image(labels_img)],
                     }, step=(epoch + 1) * len(train_dataloader) - 1)
+                    
             valid_loss = sum(valid_losses_total) / len(valid_losses_total)
             valid_mean_dice = sum(valid_dice_scores) / len(valid_dice_scores)
+            
             wandb.log({
                 "valid_loss": valid_loss,
                 "valid_mean_dice": valid_mean_dice,
@@ -480,6 +501,7 @@ def main(args):
                 if epochs_without_improvement >= args.early_stop_patience:
                     print(f"Early stopping at epoch {epoch + 1}: no Dice improvement for {args.early_stop_patience} epochs.")
                     break
+                    
     print("Training complete!")
 
     if os.path.exists(best_model_path):
