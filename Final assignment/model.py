@@ -22,36 +22,33 @@ class Model(nn.Module):
 		)
 
 		# Shared shallow stages.
-		self.layer1 = self._make_layer(32, 32, blocks=2, stride=1, drop_path_rates=[0.0, 0.0])
-		self.layer2 = self._make_layer(32, 64, blocks=2, stride=2, drop_path_rates=[0.0, 0.02])  # 1/8
+		self.layer1 = self._make_layer(32, 32, blocks=2, stride=1)
+		self.layer2 = self._make_layer(32, 64, blocks=2, stride=2)  # 1/8
 
 		# Dual-resolution stage 3.
-		self.high3 = self._make_layer(64, 64, blocks=2, stride=1, drop_path_rates=[0.02, 0.04])
+		self.high3 = self._make_layer(64, 64, blocks=2, stride=1)
 		self.down3 = ConvBNReLU(64, 128, kernel_size=3, stride=2, padding=1)  # 1/16
-		self.low3 = self._make_layer(128, 128, blocks=2, stride=1, drop_path_rates=[0.02, 0.04])
+		self.low3 = self._make_layer(128, 128, blocks=2, stride=1)
 		self.low3_to_high = nn.Conv2d(128, 64, kernel_size=1, bias=False)
 		self.high3_to_low = ConvBNReLU(64, 128, kernel_size=3, stride=2, padding=1)
 
 		# Dual-resolution stage 4.
-		self.high4 = self._make_layer(64, 64, blocks=2, stride=1, drop_path_rates=[0.04, 0.06])
+		self.high4 = self._make_layer(64, 64, blocks=2, stride=1)
 		self.down4 = ConvBNReLU(128, 256, kernel_size=3, stride=2, padding=1)  # 1/32
-		self.low4 = self._make_layer(256, 256, blocks=2, stride=1, drop_path_rates=[0.04, 0.08])
+		self.low4 = self._make_layer(256, 256, blocks=2, stride=1)
 		self.low4_to_high = nn.Conv2d(256, 64, kernel_size=1, bias=False)
 		self.high4_to_low = ConvBNReLU(64, 256, kernel_size=3, stride=2, padding=1)
 
 		# Context aggregation and heads.
 		self.dappm = DAPPM(in_channels=256, branch_channels=64, out_channels=128)
 		self.fuse = ConvBNReLU(64 + 128, 128, kernel_size=3, stride=1, padding=1)
-		self.fuse_dropout = nn.Dropout2d(p=0.1)
-		self.head = SegHead(128, 64, n_classes, dropout=0.1)
-		self.aux_head = SegHead(64, 32, n_classes, dropout=0.05)
+		self.head = SegHead(128, 64, n_classes)
+		self.aux_head = SegHead(64, 32, n_classes)
 
-	def _make_layer(self, in_channels, out_channels, blocks, stride, drop_path_rates=None):
-		if drop_path_rates is None:
-			drop_path_rates = [0.0] * blocks
-		layers = [BasicBlock(in_channels, out_channels, stride=stride, drop_path=drop_path_rates[0])]
-		for idx in range(1, blocks):
-			layers.append(BasicBlock(out_channels, out_channels, stride=1, drop_path=drop_path_rates[idx]))
+	def _make_layer(self, in_channels, out_channels, blocks, stride):
+		layers = [BasicBlock(in_channels, out_channels, stride=stride)]
+		for _ in range(1, blocks):
+			layers.append(BasicBlock(out_channels, out_channels, stride=1))
 		return nn.Sequential(*layers)
 
 	def forward(self, x):
@@ -93,7 +90,7 @@ class Model(nn.Module):
 		low_ctx = self.dappm(low)
 		low_ctx = F.interpolate(low_ctx, size=high.shape[-2:], mode="bilinear", align_corners=False)
 
-		fused = self.fuse_dropout(self.fuse(torch.cat([high, low_ctx], dim=1)))
+		fused = self.fuse(torch.cat([high, low_ctx], dim=1))
 		main_logits = self.head(fused)
 
 		main_logits = F.interpolate(main_logits, size=input_size, mode="bilinear", align_corners=False)
@@ -120,14 +117,13 @@ class ConvBNReLU(nn.Module):
 class BasicBlock(nn.Module):
 	expansion = 1
 
-	def __init__(self, in_channels, out_channels, stride=1, drop_path=0.0):
+	def __init__(self, in_channels, out_channels, stride=1):
 		super().__init__()
 		self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
 		self.bn1 = nn.BatchNorm2d(out_channels)
 		self.relu = nn.ReLU(inplace=True)
 		self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
 		self.bn2 = nn.BatchNorm2d(out_channels)
-		self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
 		if stride != 1 or in_channels != out_channels:
 			self.downsample = nn.Sequential(
@@ -150,24 +146,9 @@ class BasicBlock(nn.Module):
 		if self.downsample is not None:
 			identity = self.downsample(x)
 
-		out = self.drop_path(out) + identity
+		out = out + identity
 		out = self.relu(out)
 		return out
-
-
-class DropPath(nn.Module):
-	def __init__(self, drop_prob=0.0):
-		super().__init__()
-		self.drop_prob = drop_prob
-
-	def forward(self, x):
-		if self.drop_prob == 0.0 or not self.training:
-			return x
-		keep_prob = 1.0 - self.drop_prob
-		shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-		random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-		random_tensor.floor_()
-		return x.div(keep_prob) * random_tensor
 
 
 class DAPPM(nn.Module):
@@ -207,7 +188,6 @@ class DAPPM(nn.Module):
 		self.process2 = ConvBNReLU(branch_channels, branch_channels, kernel_size=3, stride=1, padding=1)
 		self.process3 = ConvBNReLU(branch_channels, branch_channels, kernel_size=3, stride=1, padding=1)
 		self.process4 = ConvBNReLU(branch_channels, branch_channels, kernel_size=3, stride=1, padding=1)
-		self.dropout = nn.Dropout2d(p=0.1)
 		self.compression = ConvBNReLU(branch_channels * 5, out_channels, kernel_size=1, stride=1, padding=0)
 		self.shortcut = ConvBNReLU(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
@@ -220,17 +200,16 @@ class DAPPM(nn.Module):
 		x3 = self.process3(F.interpolate(self.scale3(x), size=(height, width), mode="bilinear", align_corners=False) + x2)
 		x4 = self.process4(F.interpolate(self.scale4(x), size=(height, width), mode="bilinear", align_corners=False) + x3)
 
-		out = self.compression(self.dropout(torch.cat([x0, x1, x2, x3, x4], dim=1)))
+		out = self.compression(torch.cat([x0, x1, x2, x3, x4], dim=1))
 		out = out + self.shortcut(x)
 		return out
 
 
 class SegHead(nn.Module):
-	def __init__(self, in_channels, mid_channels, out_channels, dropout=0.0):
+	def __init__(self, in_channels, mid_channels, out_channels):
 		super().__init__()
 		self.block = nn.Sequential(
 			ConvBNReLU(in_channels, mid_channels, kernel_size=3, stride=1, padding=1),
-			nn.Dropout2d(p=dropout) if dropout > 0.0 else nn.Identity(),
 			nn.Conv2d(mid_channels, out_channels, kernel_size=1, bias=True),
 		)
 

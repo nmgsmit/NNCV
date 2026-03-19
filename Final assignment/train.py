@@ -143,36 +143,18 @@ class CityscapesSegmentation(torch.utils.data.Dataset):
         label = TF.resize(label, new_size, interpolation=InterpolationMode.NEAREST)
         return image, label
 
-    def _pad_if_needed(self, image, label):
-        crop_h, crop_w = self.crop_size
-        pad_h = max(crop_h - image.height, 0)
-        pad_w = max(crop_w - image.width, 0)
-        if pad_h > 0 or pad_w > 0:
-            padding = [0, 0, pad_w, pad_h]
-            image = TF.pad(image, padding, fill=0)
-            label = TF.pad(label, padding, fill=255)
-        return image, label
-
     def _train_transform(self, image, label):
-        image, label = self._random_rescale(image, label)
-        image, label = self._pad_if_needed(image, label)
-
-        crop_h, crop_w = self.crop_size
-        top = torch.randint(0, image.height - crop_h + 1, (1,)).item()
-        left = torch.randint(0, image.width - crop_w + 1, (1,)).item()
-        image = TF.crop(image, top, left, crop_h, crop_w)
-        label = TF.crop(label, top, left, crop_h, crop_w)
+        image = TF.resize(image, self.crop_size, interpolation=InterpolationMode.BILINEAR)
+        label = TF.resize(label, self.crop_size, interpolation=InterpolationMode.NEAREST)
 
         if random.random() < 0.5:
             image = TF.hflip(image)
             label = TF.hflip(label)
 
         image = TF.to_tensor(image)
-        image = TF.adjust_brightness(image, random.uniform(0.8, 1.2))
-        image = TF.adjust_contrast(image, random.uniform(0.8, 1.2))
-        image = TF.adjust_saturation(image, random.uniform(0.8, 1.2))
-        if random.random() < 0.2:
-            image = TF.rgb_to_grayscale(image, num_output_channels=3)
+        image = TF.adjust_brightness(image, random.uniform(0.9, 1.1))
+        image = TF.adjust_contrast(image, random.uniform(0.9, 1.1))
+        image = TF.adjust_saturation(image, random.uniform(0.9, 1.1))
         image = self.normalize(image)
 
         label = torch.as_tensor(TF.pil_to_tensor(label), dtype=torch.int64)
@@ -193,36 +175,6 @@ class CityscapesSegmentation(torch.utils.data.Dataset):
         return self._eval_transform(image, label)
 
 
-def build_optimizer_params(model: nn.Module, weight_decay: float):
-    decay_params = []
-    no_decay_params = []
-    norm_types = (
-        nn.BatchNorm1d,
-        nn.BatchNorm2d,
-        nn.BatchNorm3d,
-        nn.SyncBatchNorm,
-        nn.LayerNorm,
-        nn.GroupNorm,
-        nn.InstanceNorm1d,
-        nn.InstanceNorm2d,
-        nn.InstanceNorm3d,
-    )
-
-    for module in model.modules():
-        for name, param in module.named_parameters(recurse=False):
-            if not param.requires_grad:
-                continue
-            if name.endswith("bias") or isinstance(module, norm_types):
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-    return [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-
-
 def get_args_parser():
 
     parser = ArgumentParser("Training script for a PyTorch U-Net model")
@@ -238,8 +190,8 @@ def get_args_parser():
     parser.add_argument("--aux-weight", type=float, default=0.4, help="Weight for auxiliary OHEM loss")
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Weight for dice loss")
     parser.add_argument("--label-smoothing", type=float, default=0.05, help="Label smoothing for OHEM cross-entropy")
-    parser.add_argument("--crop-size", type=int, default=256, help="Square train/validation crop size")
-    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm")
+    parser.add_argument("--crop-size", type=int, default=256, help="Square train/validation image size")
+    parser.add_argument("--grad-clip", type=float, default=0.0, help="Gradient clipping norm; 0 disables clipping")
     parser.add_argument("--early-stop-patience", type=int, default=6, help="Number of epochs without validation improvement before stopping")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
@@ -321,17 +273,17 @@ def main(args):
 
     # Define the optimizer
     optimizer = SGD(
-        build_optimizer_params(model, args.weight_decay),
+        model.parameters(),
         lr=args.lr,
         momentum=args.momentum,
-        nesterov=True,
+        weight_decay=args.weight_decay,
     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=0.5,
-        patience=6,
+        patience=3,
         threshold=1e-4,
         verbose=True
     )
@@ -346,7 +298,6 @@ def main(args):
         # Training
         model.train()
         train_losses_total = []
-        train_dice_scores = []
         for i, (images, labels) in enumerate(train_dataloader):
             labels = convert_to_train_id(labels)
             images = images.to(device, non_blocking=True)
@@ -370,7 +321,6 @@ def main(args):
             optimizer.step()
 
             train_losses_total.append(loss.item())
-            train_dice_scores.append(1.0 - loss_dice.item())
 
             wandb.log({
                 "train_loss": loss.item(),
@@ -412,7 +362,6 @@ def main(args):
                         "labels": [wandb.Image(labels_img)],
                     }, step=(epoch + 1) * len(train_dataloader) - 1)
             train_loss = sum(train_losses_total) / len(train_losses_total)
-            train_mean_dice = sum(train_dice_scores) / len(train_dice_scores)
             valid_loss = sum(valid_losses_total) / len(valid_losses_total)
             valid_mean_dice = sum(valid_dice_scores) / len(valid_dice_scores)
             wandb.log({
