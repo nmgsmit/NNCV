@@ -10,7 +10,7 @@ class Model(nn.Module):
 	During evaluation it returns only main_logits to keep inference API simple.
 	"""
 
-	def __init__(self, in_channels=3, n_classes=19, embed_dims=(64, 128, 320, 512), depths=(3, 6, 40, 3), sr_ratios=(8, 4, 2, 1), num_heads=(1, 2, 5, 8), decoder_embedding_dim=768):
+	def __init__(self, in_channels=3, n_classes=19, embed_dims=(64, 128, 320, 512), depths=(3, 6, 40, 3), sr_ratios=(8, 4, 2, 1), num_heads=(1, 2, 5, 8), decoder_embedding_dim=768, dropout=0.1):
 		super().__init__()
 		self.in_channels = in_channels
 		self.n_classes = n_classes
@@ -25,13 +25,14 @@ class Model(nn.Module):
 			num_heads=num_heads,
 			mlp_ratio=4.0,
 			sr_ratios=sr_ratios,
-			drop_rate=0.0,
+			drop_rate=dropout,
 		)
 
 		self.decode_head = SegFormerHead(
 			in_channels=embed_dims,
 			embedding_dim=decoder_embedding_dim,
 			n_classes=n_classes,
+			dropout=dropout,
 		)
 		self.aux_head = nn.Conv2d(embed_dims[2], n_classes, kernel_size=1)
 
@@ -227,7 +228,7 @@ class MixVisionTransformerEncoder(nn.Module):
 
 
 class SegFormerHead(nn.Module):
-	def __init__(self, in_channels, embedding_dim, n_classes):
+	def __init__(self, in_channels, embedding_dim, n_classes, dropout=0.1):
 		super().__init__()
 		self.proj1 = nn.Conv2d(in_channels[0], embedding_dim, kernel_size=1)
 		self.proj2 = nn.Conv2d(in_channels[1], embedding_dim, kernel_size=1)
@@ -238,7 +239,7 @@ class SegFormerHead(nn.Module):
 			nn.Conv2d(embedding_dim * 4, embedding_dim, kernel_size=1, bias=False),
 			nn.BatchNorm2d(embedding_dim),
 			nn.ReLU(inplace=True),
-			nn.Dropout2d(0.1),
+			nn.Dropout2d(dropout),
 		)
 		self.classifier = nn.Conv2d(embedding_dim, n_classes, kernel_size=1)
 

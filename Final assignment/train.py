@@ -23,6 +23,7 @@ from torch.optim import SGD, AdamW
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import Cityscapes
 from torchvision.utils import make_grid
+
 from torchvision.transforms.v2 import (
     Compose,
     Normalize,
@@ -31,6 +32,7 @@ from torchvision.transforms.v2 import (
     ToDtype,
     InterpolationMode
 )
+import torchvision.transforms
 
 from model import Model
 
@@ -201,11 +203,15 @@ def get_args_parser():
     parser.add_argument("--early-stop-patience", type=int, default=6, help="Number of epochs without validation improvement before stopping")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
     parser.add_argument("--hflip-prob", type=float, default=0.5, help="Horizontal flip probability for training augmentation")
+    parser.add_argument("--color-jitter", type=float, default=0.4, help="Color jitter strength (0 disables)")
+    parser.add_argument("--random-crop", type=int, default=0, help="Random crop size (0 disables)")
+    parser.add_argument("--gaussian-blur", type=float, default=0.0, help="Probability of Gaussian blur (0 disables)")
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for evaluation model (<=0 disables EMA)")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="efficient DDRNET-23-slim", help="Experiment ID for Weights & Biases")
 
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate for all dropout layers in SegFormer")
     return parser
 
 
@@ -230,20 +236,29 @@ def main(args):
     # Define the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Define the transforms to apply to the data
-    img_transform = Compose([
-    ToImage(),
-    Resize((256, 256)),
-    ToDtype(torch.float32, scale=True),
-    Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    ])
+
+    # Define the transforms to apply to the data (with more augmentation)
+    img_transforms = []
+    img_transforms.append(ToImage())
+    if args.random_crop > 0:
+        img_transforms.append(torchvision.transforms.RandomCrop(args.random_crop, pad_if_needed=True))
+    img_transforms.append(Resize((256, 256)))
+    if args.color_jitter > 0:
+        img_transforms.append(torchvision.transforms.ColorJitter(brightness=args.color_jitter, contrast=args.color_jitter, saturation=args.color_jitter, hue=min(0.1, args.color_jitter)))
+    img_transforms.append(ToDtype(torch.float32, scale=True))
+    img_transforms.append(Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)))
+    if args.gaussian_blur > 0:
+        img_transforms.append(torchvision.transforms.RandomApply([torchvision.transforms.GaussianBlur(3)], p=args.gaussian_blur))
+    img_transform = Compose(img_transforms)
 
     # Target transform (mask)
-    target_transform = Compose([
-        ToImage(),
-        Resize((256, 256), interpolation=InterpolationMode.NEAREST),
-        ToDtype(torch.int64),  # no scaling
-    ])
+    target_transforms = []
+    target_transforms.append(ToImage())
+    if args.random_crop > 0:
+        target_transforms.append(torchvision.transforms.RandomCrop(args.random_crop, pad_if_needed=True))
+    target_transforms.append(Resize((256, 256), interpolation=InterpolationMode.NEAREST))
+    target_transforms.append(ToDtype(torch.int64))  # no scaling
+    target_transform = Compose(target_transforms)
 
     # Load the dataset and make a split for training and validation
     train_base_dataset = Cityscapes(
@@ -282,6 +297,7 @@ def main(args):
     model = Model(
         in_channels=3,  # RGB images
         n_classes=19,  # 19 classes in the Cityscapes dataset
+        dropout=args.dropout
     ).to(device)
     ema_model = None
     if args.ema_decay > 0.0:
@@ -319,8 +335,19 @@ def main(args):
             weight_decay=args.weight_decay,
         )
 
-    max_iter = args.epochs * len(train_dataloader)
+
+    # Set up ReduceLROnPlateau scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=3,
+        threshold=1e-4,
+        min_lr=args.lr * args.min_lr_ratio,
+        verbose=True
+    )
     global_iter = 0
+
 
     # Training loop
     best_valid_loss = float('inf')
@@ -333,22 +360,9 @@ def main(args):
         # Training
         model.train()
         for i, (images, labels) in enumerate(train_dataloader):
-
             labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
             images, labels = images.to(device), labels.to(device)
-
             labels = labels.long().squeeze(1)  # Remove channel dimension
-
-            current_lr = poly_lr(
-                effective_base_lr,
-                global_iter,
-                max_iter,
-                args.warmup_iters,
-                args.poly_power,
-                args.min_lr_ratio,
-            )
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = current_lr
 
             optimizer.zero_grad()
             outputs = model(images)
@@ -377,7 +391,7 @@ def main(args):
                 "epoch": epoch + 1,
             }, step=epoch * len(train_dataloader) + i)
             global_iter += 1
-            
+
         # Validation
         model.eval()
         eval_model = ema_model if ema_model is not None else model
@@ -386,41 +400,31 @@ def main(args):
             valid_losses_total = []
             valid_dice_scores = []
             for i, (images, labels) in enumerate(valid_dataloader):
-
                 labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
                 images, labels = images.to(device), labels.to(device)
-
                 labels = labels.long().squeeze(1)  # Remove channel dimension
-
                 outputs = eval_model(images)
                 if isinstance(outputs, tuple):
                     outputs = outputs[0]
-
                 loss_main = ohem_criterion(outputs, labels)
                 loss_dice = dice_criterion(outputs, labels)
                 loss_total = loss_main + args.dice_weight * loss_dice
                 valid_losses_total.append(loss_total.item())
                 valid_dice_scores.append((1.0 - loss_dice.item()))
-            
                 if i == 0:
                     predictions = outputs.softmax(1).argmax(1)
                     predictions = predictions.unsqueeze(1)
                     labels = labels.unsqueeze(1)
-
                     predictions = convert_train_id_to_color(predictions)
                     labels = convert_train_id_to_color(labels)
-
                     predictions_img = make_grid(predictions.cpu(), nrow=8)
                     labels_img = make_grid(labels.cpu(), nrow=8)
-
                     predictions_img = predictions_img.permute(1, 2, 0).numpy()
                     labels_img = labels_img.permute(1, 2, 0).numpy()
-
                     wandb.log({
                         "predictions": [wandb.Image(predictions_img)],
                         "labels": [wandb.Image(labels_img)],
                     }, step=(epoch + 1) * len(train_dataloader) - 1)
-            
             valid_loss = sum(valid_losses_total) / len(valid_losses_total)
             valid_mean_dice = sum(valid_dice_scores) / len(valid_dice_scores)
             wandb.log({
@@ -428,6 +432,9 @@ def main(args):
                 "valid_mean_dice": valid_mean_dice,
                 "epoch": epoch + 1,
             }, step=(epoch + 1) * len(train_dataloader) - 1)
+
+            # Step the ReduceLROnPlateau scheduler
+            scheduler.step(valid_loss)
 
             if valid_mean_dice > best_dice + args.early_stop_min_delta:
                 best_dice = valid_mean_dice
@@ -442,7 +449,6 @@ def main(args):
                 if epochs_without_improvement >= args.early_stop_patience:
                     print(f"Early stopping at epoch {epoch + 1}: no Dice improvement for {args.early_stop_patience} epochs.")
                     break
-        
     print("Training complete!")
 
     if os.path.exists(best_model_path):
