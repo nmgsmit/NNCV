@@ -13,21 +13,19 @@ allowing you to easily modify hyperparameters using a command-line argument pars
 Feel free to customize the script as needed for your use case.
 """
 import os
+import random
 from argparse import ArgumentParser
 
 import wandb
 import torch
 import torch.nn as nn
+import torchvision.transforms.functional as TF
 from torch.optim import SGD
 from torch.utils.data import DataLoader
 from torchvision.datasets import Cityscapes
 from torchvision.utils import make_grid
 from torchvision.transforms.v2 import (
-    Compose,
     Normalize,
-    Resize,
-    ToImage,
-    ToDtype,
     InterpolationMode
 )
 
@@ -122,8 +120,107 @@ class DiceLoss(nn.Module):
         return 1.0 - dice.mean()
 
 
-def poly_lr(base_lr: float, current_iter: int, max_iter: int, power: float = 0.9) -> float:
-    return base_lr * ((1.0 - float(current_iter) / max_iter) ** power)
+class CityscapesSegmentation(torch.utils.data.Dataset):
+    def __init__(self, data_dir: str, split: str, crop_size=(256, 256), train: bool = False):
+        self.dataset = Cityscapes(
+            data_dir,
+            split=split,
+            mode="fine",
+            target_type="semantic",
+        )
+        self.crop_size = crop_size
+        self.train = train
+        self.normalize = Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _random_rescale(self, image, label):
+        scale = random.uniform(0.75, 1.5)
+        height, width = image.height, image.width
+        new_size = (max(1, int(height * scale)), max(1, int(width * scale)))
+        image = TF.resize(image, new_size, interpolation=InterpolationMode.BILINEAR)
+        label = TF.resize(label, new_size, interpolation=InterpolationMode.NEAREST)
+        return image, label
+
+    def _pad_if_needed(self, image, label):
+        crop_h, crop_w = self.crop_size
+        pad_h = max(crop_h - image.height, 0)
+        pad_w = max(crop_w - image.width, 0)
+        if pad_h > 0 or pad_w > 0:
+            padding = [0, 0, pad_w, pad_h]
+            image = TF.pad(image, padding, fill=0)
+            label = TF.pad(label, padding, fill=255)
+        return image, label
+
+    def _train_transform(self, image, label):
+        image, label = self._random_rescale(image, label)
+        image, label = self._pad_if_needed(image, label)
+
+        crop_h, crop_w = self.crop_size
+        top = torch.randint(0, image.height - crop_h + 1, (1,)).item()
+        left = torch.randint(0, image.width - crop_w + 1, (1,)).item()
+        image = TF.crop(image, top, left, crop_h, crop_w)
+        label = TF.crop(label, top, left, crop_h, crop_w)
+
+        if random.random() < 0.5:
+            image = TF.hflip(image)
+            label = TF.hflip(label)
+
+        image = TF.to_tensor(image)
+        image = TF.adjust_brightness(image, random.uniform(0.8, 1.2))
+        image = TF.adjust_contrast(image, random.uniform(0.8, 1.2))
+        image = TF.adjust_saturation(image, random.uniform(0.8, 1.2))
+        if random.random() < 0.2:
+            image = TF.rgb_to_grayscale(image, num_output_channels=3)
+        image = self.normalize(image)
+
+        label = torch.as_tensor(TF.pil_to_tensor(label), dtype=torch.int64)
+        return image, label
+
+    def _eval_transform(self, image, label):
+        image = TF.resize(image, self.crop_size, interpolation=InterpolationMode.BILINEAR)
+        label = TF.resize(label, self.crop_size, interpolation=InterpolationMode.NEAREST)
+        image = TF.to_tensor(image)
+        image = self.normalize(image)
+        label = torch.as_tensor(TF.pil_to_tensor(label), dtype=torch.int64)
+        return image, label
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        if self.train:
+            return self._train_transform(image, label)
+        return self._eval_transform(image, label)
+
+
+def build_optimizer_params(model: nn.Module, weight_decay: float):
+    decay_params = []
+    no_decay_params = []
+    norm_types = (
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.SyncBatchNorm,
+        nn.LayerNorm,
+        nn.GroupNorm,
+        nn.InstanceNorm1d,
+        nn.InstanceNorm2d,
+        nn.InstanceNorm3d,
+    )
+
+    for module in model.modules():
+        for name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad:
+                continue
+            if name.endswith("bias") or isinstance(module, norm_types):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+    return [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
 
 
 def get_args_parser():
@@ -141,6 +238,8 @@ def get_args_parser():
     parser.add_argument("--aux-weight", type=float, default=0.4, help="Weight for auxiliary OHEM loss")
     parser.add_argument("--dice-weight", type=float, default=1.0, help="Weight for dice loss")
     parser.add_argument("--label-smoothing", type=float, default=0.05, help="Label smoothing for OHEM cross-entropy")
+    parser.add_argument("--crop-size", type=int, default=256, help="Square train/validation crop size")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping norm")
     parser.add_argument("--early-stop-patience", type=int, default=6, help="Number of epochs without validation improvement before stopping")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
@@ -166,56 +265,43 @@ def main(args):
     # If you add other sources of randomness (NumPy, Random), 
     # make sure to set their seeds as well
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
     torch.backends.cudnn.deterministic = True
 
     # Define the device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Define the transforms to apply to the data
-    img_transform = Compose([
-    ToImage(),
-    Resize((256, 256)),
-    ToDtype(torch.float32, scale=True),
-    Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    ])
-
-    # Target transform (mask)
-    target_transform = Compose([
-        ToImage(),
-        Resize((256, 256), interpolation=InterpolationMode.NEAREST),
-        ToDtype(torch.int64),  # no scaling
-    ])
-
     # Load the dataset and make a split for training and validation
-    train_dataset = Cityscapes(
-    args.data_dir,
-    split="train",
-    mode="fine",
-    target_type="semantic",
-    transform=img_transform,
-    target_transform=target_transform,
+    crop_size = (args.crop_size, args.crop_size)
+    train_dataset = CityscapesSegmentation(
+        args.data_dir,
+        split="train",
+        crop_size=crop_size,
+        train=True,
     )
 
-    valid_dataset = Cityscapes(
+    valid_dataset = CityscapesSegmentation(
         args.data_dir,
         split="val",
-        mode="fine",
-        target_type="semantic",
-        transform=img_transform,
-        target_transform=target_transform,
+        crop_size=crop_size,
+        train=False,
     )
 
     train_dataloader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
         shuffle=True,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
     )
     valid_dataloader = DataLoader(
         valid_dataset, 
         batch_size=args.batch_size, 
         shuffle=False,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
     )
 
     # Define the model
@@ -235,10 +321,10 @@ def main(args):
 
     # Define the optimizer
     optimizer = SGD(
-        model.parameters(),
+        build_optimizer_params(model, args.weight_decay),
         lr=args.lr,
         momentum=args.momentum,
-        weight_decay=args.weight_decay,
+        nesterov=True,
     )
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -250,7 +336,7 @@ def main(args):
         verbose=True
     )
 
-    best_valid_loss = float('inf')
+    best_valid_loss = float("inf")
     best_dice = -float('inf')
     epochs_without_improvement = 0
     best_model_path = os.path.join(output_dir, "best_model.pt")
@@ -259,9 +345,12 @@ def main(args):
 
         # Training
         model.train()
+        train_losses_total = []
+        train_dice_scores = []
         for i, (images, labels) in enumerate(train_dataloader):
             labels = convert_to_train_id(labels)
-            images, labels = images.to(device), labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             labels = labels.long().squeeze(1)
             optimizer.zero_grad()
             outputs = model(images)
@@ -276,7 +365,12 @@ def main(args):
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite loss encountered; try lower lr or enable --skip-nonfinite-batches")
             loss.backward()
+            if args.grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             optimizer.step()
+
+            train_losses_total.append(loss.item())
+            train_dice_scores.append(1.0 - loss_dice.item())
 
             wandb.log({
                 "train_loss": loss.item(),
@@ -292,7 +386,8 @@ def main(args):
             valid_dice_scores = []
             for i, (images, labels) in enumerate(valid_dataloader):
                 labels = convert_to_train_id(labels)
-                images, labels = images.to(device), labels.to(device)
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
                 labels = labels.long().squeeze(1)
                 outputs = model(images)
                 if isinstance(outputs, tuple):
@@ -316,18 +411,23 @@ def main(args):
                         "predictions": [wandb.Image(predictions_img)],
                         "labels": [wandb.Image(labels_img)],
                     }, step=(epoch + 1) * len(train_dataloader) - 1)
+            train_loss = sum(train_losses_total) / len(train_losses_total)
+            train_mean_dice = sum(train_dice_scores) / len(train_dice_scores)
             valid_loss = sum(valid_losses_total) / len(valid_losses_total)
             valid_mean_dice = sum(valid_dice_scores) / len(valid_dice_scores)
             wandb.log({
-                "valid_loss": valid_loss,
                 "valid_mean_dice": valid_mean_dice,
+                "valid_loss": valid_loss,
+                "train_loss": train_loss,
+                "learning_rate": optimizer.param_groups[0]['lr'],
                 "epoch": epoch + 1,
+                "generalization_gap": valid_loss - train_loss,
             }, step=(epoch + 1) * len(train_dataloader) - 1)
             scheduler.step(valid_loss)
             if valid_mean_dice > best_dice + args.early_stop_min_delta:
                 best_dice = valid_mean_dice
                 best_valid_loss = valid_loss
-              
+
                 torch.save(model.state_dict(), best_model_path)
                 epochs_without_improvement = 0
             else:
@@ -342,7 +442,7 @@ def main(args):
         model.state_dict(),
         os.path.join(
             output_dir,
-            f"final_model-epoch={epoch:04}-best_val_loss={best_valid_loss:04}.pt"
+            f"final_model-epoch={epoch + 1:04}-best_val_loss={best_valid_loss:.4f}.pt"
         )
     )
     wandb.finish()
