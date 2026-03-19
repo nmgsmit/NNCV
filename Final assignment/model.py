@@ -224,44 +224,63 @@ class Model(nn.Module):
         )
 
     def load_pretrained(self, folder_path):
-        """Loads weights from HuggingFace local folder."""
+        """Loads weights from HuggingFace local folder and adapts kv weights if needed."""
         weight_path = os.path.join(folder_path, "pytorch_model.bin")
         if not os.path.exists(weight_path):
             raise FileNotFoundError(f"Missing weights at {weight_path}")
 
         state_dict = torch.load(weight_path, map_location="cpu")
         new_state_dict = {}
-        
+
+        # Temporary storage for key/value weights to be concatenated
+        kv_weight_buffers = {}
+        kv_bias_buffers = {}
+
         for key, value in state_dict.items():
             if not key.startswith("segformer.encoder"):
                 continue
-            
+
             k = key.replace("segformer.encoder.", "encoder.")
-            
+
             # Map Stages/Patch Embeddings
             k = k.replace("patch_embeddings.0", "stage1.patch_embed")
             k = k.replace("patch_embeddings.1", "stage2.patch_embed")
             k = k.replace("patch_embeddings.2", "stage3.patch_embed")
             k = k.replace("patch_embeddings.3", "stage4.patch_embed")
-            
+
             # Map Layer Norms
             k = k.replace("layer_norm.0", "stage1.norm")
             k = k.replace("layer_norm.1", "stage2.norm")
             k = k.replace("layer_norm.2", "stage3.norm")
             k = k.replace("layer_norm.3", "stage4.norm")
-            
+
             # Map Blocks
             k = k.replace("block.0", "stage1.blocks")
             k = k.replace("block.1", "stage2.blocks")
             k = k.replace("block.2", "stage3.blocks")
             k = k.replace("block.3", "stage4.blocks")
-            
-            # Map Attention sub-keys 
+
+            # Map Attention sub-keys
+            if ".attention.self.key.weight" in key:
+                # Buffer for later concat
+                kv_weight_buffers[k.replace(".attention.self.key.weight", ".attn.kv.weight")] = value
+                continue
+            if ".attention.self.value.weight" in key:
+                # Buffer for later concat
+                kv_weight_buffers[k.replace(".attention.self.value.weight", ".attn.kv.weight")] = (
+                    kv_weight_buffers.get(k.replace(".attention.self.value.weight", ".attn.kv.weight")), value)
+                continue
+            if ".attention.self.key.bias" in key:
+                kv_bias_buffers[k.replace(".attention.self.key.bias", ".attn.kv.bias")] = value
+                continue
+            if ".attention.self.value.bias" in key:
+                kv_bias_buffers[k.replace(".attention.self.value.bias", ".attn.kv.bias")] = (
+                    kv_bias_buffers.get(k.replace(".attention.self.value.bias", ".attn.kv.bias")), value)
+                continue
+
             k = k.replace(".attention.self.query", ".attn.q")
-            k = k.replace(".attention.self.key", ".attn.kv") 
-            k = k.replace(".attention.self.value", ".attn.kv") 
             k = k.replace(".attention.output.dense", ".attn.proj")
-            
+
             # Map FFN/MLP sub-keys
             k = k.replace(".mlp.dense1", ".mlp.fc1")
             k = k.replace(".mlp.dwconv.dwconv", ".mlp.dwconv")
@@ -269,6 +288,24 @@ class Model(nn.Module):
 
             if k in self.state_dict():
                 new_state_dict[k] = value
+
+        # Now handle kv weights/biases that need concatenation
+        for k, v in kv_weight_buffers.items():
+            if isinstance(v, tuple):
+                # (key_weight, value_weight)
+                key_weight, value_weight = v
+                if key_weight is not None and value_weight is not None:
+                    new_state_dict[k] = torch.cat([key_weight, value_weight], dim=0)
+            else:
+                # Only one present, skip
+                continue
+        for k, v in kv_bias_buffers.items():
+            if isinstance(v, tuple):
+                key_bias, value_bias = v
+                if key_bias is not None and value_bias is not None:
+                    new_state_dict[k] = torch.cat([key_bias, value_bias], dim=0)
+            else:
+                continue
 
         msg = self.load_state_dict(new_state_dict, strict=False)
         print(f"Pretrained encoder loaded: {msg}")
