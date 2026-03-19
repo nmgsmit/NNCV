@@ -5,7 +5,7 @@ wandb login
 
 # Tune workers to available CPU threads while avoiding oversubscription on shared nodes.
 NUM_WORKERS=${NUM_WORKERS:-8}
-EXPERIMENT_ID=${EXPERIMENT_ID:-"DDRNET-23-slim BEST"}
+EXPERIMENT_ID=${EXPERIMENT_ID:-"DDRNET-23-slim BETTER"}
 
 python3 train.py \
     --data-dir ./data/cityscapes \
@@ -22,8 +22,6 @@ python3 train.py \
     --label-smoothing 0.05 \
     --early-stop-patience 6 \
     --early-stop-min-delta 1e-4 \
-    --hflip-prob 0.5 \
-    --ema-decay 0.999 \
     --num-workers "${NUM_WORKERS}" \
     --seed 42 \
     --experiment-id "${EXPERIMENT_ID}"
