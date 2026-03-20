@@ -6,9 +6,11 @@ import copy
 import os
 import random
 from argparse import ArgumentParser
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from torch.optim import AdamW, SGD
 from torch.utils.data import DataLoader, Dataset
@@ -308,13 +310,88 @@ def compute_mean_dice(confmat):
     return dice.mean().item()
 
 
+def parse_eval_scales(scales) -> tuple[float, ...]:
+    values = scales if isinstance(scales, (list, tuple)) else str(scales).split(",")
+    parsed = []
+    for value in values:
+        scale = float(str(value).strip())
+        if scale <= 0.0:
+            raise ValueError(f"Evaluation scales must be positive, got {scale}.")
+        parsed.append(scale)
+
+    if not parsed:
+        raise ValueError("At least one evaluation scale must be provided.")
+    return tuple(parsed)
+
+
+def autocast_context(enabled: bool):
+    if enabled:
+        return torch.cuda.amp.autocast(dtype=torch.float16)
+    return nullcontext()
+
+
+def forward_main_logits(model: nn.Module, images: torch.Tensor) -> torch.Tensor:
+    outputs = model(images)
+    return outputs[0] if isinstance(outputs, tuple) else outputs
+
+
+def multi_scale_inference(
+    model: nn.Module,
+    images: torch.Tensor,
+    scales: tuple[float, ...],
+    flip: bool,
+    amp_enabled: bool,
+) -> torch.Tensor:
+    target_size = images.shape[-2:]
+    fused_logits = None
+    num_predictions = 0
+
+    for scale in scales:
+        if scale == 1.0:
+            scaled_images = images
+        else:
+            scaled_size = (
+                max(1, int(round(target_size[0] * scale))),
+                max(1, int(round(target_size[1] * scale))),
+            )
+            scaled_images = F.interpolate(
+                images,
+                size=scaled_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        with autocast_context(amp_enabled):
+            logits = forward_main_logits(model, scaled_images)
+        logits = F.interpolate(logits.float(), size=target_size, mode="bilinear", align_corners=False)
+
+        fused_logits = logits if fused_logits is None else fused_logits + logits
+        num_predictions += 1
+
+        if flip:
+            flipped_images = torch.flip(scaled_images, dims=[3])
+            with autocast_context(amp_enabled):
+                flipped_logits = forward_main_logits(model, flipped_images)
+            flipped_logits = torch.flip(flipped_logits, dims=[3])
+            flipped_logits = F.interpolate(
+                flipped_logits.float(),
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+            fused_logits = fused_logits + flipped_logits
+            num_predictions += 1
+
+    return fused_logits / max(num_predictions, 1)
+
+
 def get_args_parser():
     parser = ArgumentParser("Training script for SegFormer on Cityscapes")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
     parser.add_argument(
         "--model-variant",
         type=str,
-        default="b0",
+        default="b5",
         choices=sorted(SEGFORMER_CONFIGS),
         help="SegFormer backbone preset to use",
     )
@@ -325,10 +402,10 @@ def get_args_parser():
         help="Path to pretrained weights folder; defaults to ./mit-<model-variant>",
     )
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd", "adamw"], help="Optimizer type")
-    parser.add_argument("--batch-size", type=int, default=16, help="Training batch size")
-    parser.add_argument("--base-batch-size", type=int, default=16, help="Reference batch size used for LR scaling")
+    parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
+    parser.add_argument("--base-batch-size", type=int, default=4, help="Reference batch size used for LR scaling")
     parser.add_argument("--scale-lr-with-batch", action="store_true", help="Scale LR linearly with batch size")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=80, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=6e-5, help="Base learning rate")
     parser.add_argument("--momentum", type=float, default=0.9, help="Momentum for SGD")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay")
@@ -337,9 +414,10 @@ def get_args_parser():
     parser.add_argument("--min-lr-ratio", type=float, default=0.0, help="Minimum LR as a ratio of base LR")
     parser.add_argument("--ohem-thresh", type=float, default=0.7, help="OHEM threshold")
     parser.add_argument("--ohem-min-kept", type=int, default=131072, help="Minimum hard pixels for OHEM")
-    parser.add_argument("--aux-weight", type=float, default=0.4, help="Weight for auxiliary OHEM loss")
-    parser.add_argument("--dice-weight", type=float, default=0.5, help="Weight for dice loss")
-    parser.add_argument("--label-smoothing", type=float, default=0.05, help="Label smoothing for OHEM cross-entropy")
+    parser.add_argument("--aux-weight", type=float, default=0.2, help="Weight for auxiliary OHEM loss")
+    parser.add_argument("--aux-dice-weight", type=float, default=0.2, help="Weight for auxiliary dice loss")
+    parser.add_argument("--dice-weight", type=float, default=1.0, help="Weight for dice loss")
+    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for OHEM cross-entropy")
     parser.add_argument("--early-stop-patience", type=int, default=10, help="Number of epochs without validation improvement before stopping")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
     parser.add_argument("--hflip-prob", type=float, default=0.5, help="Horizontal flip probability for training augmentation")
@@ -348,6 +426,13 @@ def get_args_parser():
     parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for evaluation model (<=0 disables EMA)")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--eval-scales", type=str, default="0.75,1.0,1.25", help="Comma-separated multi-scale validation factors")
+    parser.add_argument("--eval-flip", dest="eval_flip", action="store_true", help="Enable horizontal flip during validation TTA")
+    parser.add_argument("--no-eval-flip", dest="eval_flip", action="store_false", help="Disable horizontal flip during validation TTA")
+    parser.set_defaults(eval_flip=True)
+    parser.add_argument("--amp", dest="amp", action="store_true", help="Enable CUDA AMP training/inference")
+    parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA AMP training/inference")
+    parser.set_defaults(amp=True)
     parser.add_argument(
         "--experiment-id",
         type=str,
@@ -366,12 +451,18 @@ def resolve_pretrained_path(args):
 
 def main(args):
     pretrained_path = resolve_pretrained_path(args)
-    experiment_id = args.experiment_id or f"segformer-{args.model_variant}"
+    eval_scales = parse_eval_scales(args.eval_scales)
+    experiment_id = args.experiment_id or f"segformer-{args.model_variant}-dice-amp"
+    amp_enabled = args.amp and torch.cuda.is_available()
 
     wandb.init(
         project="5lsm0-cityscapes-segmentation",
         name=experiment_id,
-        config=vars(args),
+        config={
+            **vars(args),
+            "eval_scales": list(eval_scales),
+            "amp_enabled": amp_enabled,
+        },
     )
 
     output_dir = os.path.join("checkpoints", experiment_id)
@@ -469,10 +560,12 @@ def main(args):
             momentum=args.momentum,
             weight_decay=args.weight_decay,
         )
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     global_iter = 0
     total_iters = args.epochs * len(train_dataloader)
 
+    best_dice = -float("inf")
     best_miou = -float("inf")
     best_valid_loss = float("inf")
     epochs_without_improvement = 0
@@ -501,23 +594,35 @@ def main(args):
                 param_group["lr"] = current_lr
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(images)
-            main_logits, aux_logits = outputs if isinstance(outputs, tuple) else (outputs, None)
+            with autocast_context(amp_enabled):
+                outputs = model(images)
+                main_logits, aux_logits = outputs if isinstance(outputs, tuple) else (outputs, None)
 
-            loss_main = ohem_criterion(main_logits, labels)
-            loss_aux = (
-                ohem_criterion(aux_logits, labels)
-                if aux_logits is not None else torch.tensor(0.0, device=device)
-            )
-            loss_dice = dice_criterion(main_logits, labels)
-            loss = loss_main + args.aux_weight * loss_aux + args.dice_weight * loss_dice
+                loss_main = ohem_criterion(main_logits, labels)
+                loss_aux = (
+                    ohem_criterion(aux_logits, labels)
+                    if aux_logits is not None else torch.tensor(0.0, device=device)
+                )
+                loss_dice = dice_criterion(main_logits, labels)
+                loss_aux_dice = (
+                    dice_criterion(aux_logits, labels)
+                    if aux_logits is not None else torch.tensor(0.0, device=device)
+                )
+                loss = (
+                    loss_main
+                    + args.aux_weight * loss_aux
+                    + args.dice_weight * loss_dice
+                    + args.aux_dice_weight * loss_aux_dice
+                )
 
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite loss encountered; try lowering the learning rate.")
 
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             if ema_model is not None:
                 update_ema_model(ema_model, model, args.ema_decay)
@@ -529,6 +634,7 @@ def main(args):
                     "train_loss_main": loss_main.item(),
                     "train_loss_aux": loss_aux.item(),
                     "train_loss_dice": loss_dice.item(),
+                    "train_loss_aux_dice": loss_aux_dice.item(),
                     "learning_rate": current_lr,
                     "epoch": epoch + 1,
                 },
@@ -549,9 +655,13 @@ def main(args):
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True).long().squeeze(1)
 
-                outputs = eval_model(images)
-                if isinstance(outputs, tuple):
-                    outputs = outputs[0]
+                outputs = multi_scale_inference(
+                    eval_model,
+                    images,
+                    scales=eval_scales,
+                    flip=args.eval_flip,
+                    amp_enabled=amp_enabled,
+                )
 
                 loss_main = ohem_criterion(outputs, labels)
                 loss_dice = dice_criterion(outputs, labels)
@@ -592,7 +702,8 @@ def main(args):
                 step=global_iter - 1,
             )
 
-            if valid_miou > best_miou + args.early_stop_min_delta:
+            if valid_mean_dice > best_dice + args.early_stop_min_delta:
+                best_dice = valid_mean_dice
                 best_miou = valid_miou
                 best_valid_loss = valid_loss
                 checkpoint_source = ema_model if ema_model is not None else model
@@ -603,7 +714,7 @@ def main(args):
                 if epochs_without_improvement >= args.early_stop_patience:
                     print(
                         f"Early stopping at epoch {epoch + 1}: "
-                        f"no mIoU improvement for {args.early_stop_patience} epochs."
+                        f"no Dice improvement for {args.early_stop_patience} epochs."
                     )
                     break
 
@@ -616,7 +727,7 @@ def main(args):
         model.state_dict(),
         os.path.join(
             output_dir,
-            f"final_model-epoch={epoch:04}-best_miou={best_miou:.4f}-best_val_loss={best_valid_loss:.4f}.pt",
+            f"final_model-epoch={epoch:04}-best_dice={best_dice:.4f}-best_miou={best_miou:.4f}-best_val_loss={best_valid_loss:.4f}.pt",
         ),
     )
     wandb.finish()
