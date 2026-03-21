@@ -16,6 +16,22 @@ fi
 
 wandb login
 
+if command -v git >/dev/null 2>&1; then
+  echo "  Git branch:     $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  echo "  Git commit:     $(git log -1 --oneline 2>/dev/null || echo unknown)"
+fi
+
+# Avoid stale Python bytecode after branch switches on shared filesystems.
+rm -rf __pycache__
+
+"${PYTHON_BIN}" - <<'PY'
+from model import SEGFORMER_CONFIGS, build_model
+
+print("Preflight import OK:")
+print("  SegFormer variants:", ", ".join(sorted(SEGFORMER_CONFIGS)))
+print("  Builder:", build_model.__name__)
+PY
+
 DEFAULT_WORKERS=8
 if command -v nproc >/dev/null 2>&1; then
   DEFAULT_WORKERS="$(nproc)"

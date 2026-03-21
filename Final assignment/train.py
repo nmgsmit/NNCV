@@ -326,7 +326,7 @@ def parse_eval_scales(scales) -> tuple[float, ...]:
 
 def autocast_context(enabled: bool):
     if enabled:
-        return torch.cuda.amp.autocast(dtype=torch.float16)
+        return torch.amp.autocast("cuda", dtype=torch.float16)
     return nullcontext()
 
 
@@ -560,7 +560,7 @@ def main(args):
             momentum=args.momentum,
             weight_decay=args.weight_decay,
         )
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     global_iter = 0
     total_iters = args.epochs * len(train_dataloader)
