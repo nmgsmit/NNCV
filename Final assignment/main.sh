@@ -12,6 +12,7 @@ LR=${LR:-3e-3}
 WEIGHT_DECAY=${WEIGHT_DECAY:-1e-3}
 LABEL_SMOOTHING=${LABEL_SMOOTHING:-0.05}
 EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-6}
+EARLY_STOP_MIN_EPOCHS=${EARLY_STOP_MIN_EPOCHS:-20}
 
 python3 train.py \
     --data-dir ./data/cityscapes \
@@ -27,6 +28,7 @@ python3 train.py \
     --dice-weight 1.0 \
     --label-smoothing "${LABEL_SMOOTHING}" \
     --early-stop-patience "${EARLY_STOP_PATIENCE}" \
+    --early-stop-min-epochs "${EARLY_STOP_MIN_EPOCHS}" \
     --early-stop-min-delta 1e-4 \
     --num-workers "${NUM_WORKERS}" \
     --seed 42 \

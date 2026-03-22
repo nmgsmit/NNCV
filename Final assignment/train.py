@@ -90,6 +90,12 @@ def compute_mean_iou(confusion_matrix: torch.Tensor, eps: float = 1e-6) -> tuple
     return mean_iou, iou_per_class
 
 
+def has_improved(current: float, best: float, min_delta: float, higher_is_better: bool = True) -> bool:
+    if higher_is_better:
+        return current > best + min_delta
+    return current < best - min_delta
+
+
 class OHEMCrossEntropyLoss(nn.Module):
     def __init__(self, ignore_index=255, thresh=0.7, min_kept=131072, label_smoothing=0.0):
         super().__init__()
@@ -230,6 +236,7 @@ def get_args_parser():
     parser.add_argument("--grad-clip", type=float, default=0.0, help="Gradient clipping norm; 0 disables clipping")
     parser.add_argument("--early-stop-patience", type=int, default=6, help="Number of epochs without validation improvement before stopping")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
+    parser.add_argument("--early-stop-min-epochs", type=int, default=20, help="Minimum number of epochs to train before early stopping can trigger")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="efficient DDRNET-23-slim", help="Experiment ID for Weights & Biases")
@@ -327,16 +334,16 @@ def main(args):
 
     best_valid_loss = float("inf")
     best_valid_miou = -float("inf")
+    best_epoch = 0
     epochs_without_improvement = 0
     best_model_path = os.path.join(output_dir, "best_model.pt")
+    global_iter = 0
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1:04}/{args.epochs:04}")
 
         # Training
         model.train()
         train_losses_total = []
-        train_main_losses = []
-        train_dice_losses = []
         for i, (images, labels) in enumerate(train_dataloader):
             labels = convert_to_train_id(labels)
             images = images.to(device, non_blocking=True)
@@ -360,13 +367,18 @@ def main(args):
             optimizer.step()
 
             train_losses_total.append(loss.item())
-            train_main_losses.append(loss_main.item())
-            train_dice_losses.append(loss_dice.item())
-
-            wandb.log({
-                "learning_rate": optimizer.param_groups[0]['lr'],
-                "epoch": epoch + 1,
-            }, step=epoch * len(train_dataloader) + i)
+            wandb.log(
+                {
+                    "train_loss": loss.item(),
+                    "train_loss_main": loss_main.item(),
+                    "train_loss_aux": loss_aux.item(),
+                    "train_loss_dice": loss_dice.item(),
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                    "epoch": epoch + 1,
+                },
+                step=global_iter,
+            )
+            global_iter += 1
 
         # Validation
         model.eval()
@@ -407,38 +419,42 @@ def main(args):
                     wandb.log({
                         "predictions": [wandb.Image(predictions_img)],
                         "labels": [wandb.Image(labels_img)],
-                    }, step=(epoch + 1) * len(train_dataloader) - 1)
+                    }, step=global_iter - 1)
             train_loss = sum(train_losses_total) / len(train_losses_total)
-            train_main_loss = sum(train_main_losses) / len(train_main_losses)
-            train_mean_dice = 1.0 - (sum(train_dice_losses) / len(train_dice_losses))
             valid_loss = sum(valid_losses_total) / len(valid_losses_total)
-            valid_ce_loss = sum(valid_ce_losses) / len(valid_ce_losses)
             valid_mean_dice = 1.0 - (sum(valid_dice_losses) / len(valid_dice_losses))
             valid_mean_iou, _ = compute_mean_iou(confusion_matrix)
-            wandb.log({
-                "train_loss_step": train_losses_total[-1],
-                "train_loss": train_loss,
-                "train_main_loss": train_main_loss,
-                "train_mean_dice": train_mean_dice,
-                "valid_mean_dice": valid_mean_dice,
-                "valid_loss": valid_loss,
-                "valid_ce_loss": valid_ce_loss,
-                "valid_mean_iou": valid_mean_iou,
-                "learning_rate": optimizer.param_groups[0]['lr'],
-                "epoch": epoch + 1,
-                "generalization_gap": valid_loss - train_loss,
-            }, step=(epoch + 1) * len(train_dataloader) - 1)
+            wandb.log(
+                {
+                    "epoch": epoch + 1,
+                    "epoch_train_loss": train_loss,
+                    "valid_loss": valid_loss,
+                    "valid_mean_dice": valid_mean_dice,
+                    "valid_miou": valid_mean_iou,
+                },
+                step=global_iter - 1,
+            )
             scheduler.step(valid_mean_iou)
-            if valid_mean_iou > best_valid_miou + args.early_stop_min_delta:
-                best_valid_miou = valid_mean_iou
-                best_valid_loss = valid_loss
+
+            miou_improved = has_improved(valid_mean_iou, best_valid_miou, args.early_stop_min_delta, higher_is_better=True)
+            loss_improved = has_improved(valid_loss, best_valid_loss, args.early_stop_min_delta, higher_is_better=False)
+
+            if miou_improved or loss_improved:
+                if miou_improved:
+                    best_valid_miou = valid_mean_iou
+                if loss_improved:
+                    best_valid_loss = valid_loss
+                best_epoch = epoch + 1
 
                 torch.save(model.state_dict(), best_model_path)
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
-                if epochs_without_improvement >= args.early_stop_patience:
-                    print(f"Early stopping at epoch {epoch + 1}: no mIoU improvement for {args.early_stop_patience} epochs.")
+                if (epoch + 1) >= args.early_stop_min_epochs and epochs_without_improvement >= args.early_stop_patience:
+                    print(
+                        f"Early stopping at epoch {epoch + 1}: no validation improvement "
+                        f"(mIoU or loss) for {args.early_stop_patience} epochs after epoch {args.early_stop_min_epochs}."
+                    )
                     break
     print("Training complete!")
     if os.path.exists(best_model_path):
@@ -447,7 +463,7 @@ def main(args):
         model.state_dict(),
         os.path.join(
             output_dir,
-            f"final_model-epoch={epoch + 1:04}-best_val_loss={best_valid_loss:.4f}.pt"
+            f"final_model-epoch={epoch + 1:04}-best_epoch={best_epoch:04}-best_miou={best_valid_miou:.4f}-best_val_loss={best_valid_loss:.4f}.pt"
         )
     )
     wandb.finish()
