@@ -40,73 +40,15 @@ fi
 NUM_WORKERS=${NUM_WORKERS:-$DEFAULT_WORKERS}
 NUM_WORKERS=$(( NUM_WORKERS > 12 ? 12 : NUM_WORKERS ))
 
-OPTIMIZER=${OPTIMIZER:-adamw}
-BATCH_SIZE=${BATCH_SIZE:-4}
-BASE_BATCH_SIZE=${BASE_BATCH_SIZE:-4}
-EPOCHS=${EPOCHS:-80}
-LR=${LR:-6e-5}
-WEIGHT_DECAY=${WEIGHT_DECAY:-1e-2}
-WARMUP_ITERS=${WARMUP_ITERS:-1500}
-POLY_POWER=${POLY_POWER:-0.9}
-MIN_LR_RATIO=${MIN_LR_RATIO:-1e-3}
-EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-12}
-EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-1e-4}
-HFLIP_PROB=${HFLIP_PROB:-0.5}
-COLOR_JITTER=${COLOR_JITTER:-0.4}
-GAUSSIAN_BLUR=${GAUSSIAN_BLUR:-0.0}
-EMA_DECAY=${EMA_DECAY:-0.999}
-SEED=${SEED:-42}
-DROPOUT=${DROPOUT:-0.1}
-USE_AMP=${USE_AMP:-1}
-EVAL_SCALES=${EVAL_SCALES:-0.75,1.0,1.25}
-EVAL_FLIP=${EVAL_FLIP:-1}
-
-echo "Launching training with:"
+# Keep training defaults in train.py so this launcher stays simple.
+echo "Launching training:"
 echo "  Python:         ${PYTHON_BIN}"
 echo "  Model variant:  ${MODEL_VARIANT}"
 echo "  Experiment:     ${EXPERIMENT_ID}"
-echo "  Batch size:     ${BATCH_SIZE}"
 echo "  Workers:        ${NUM_WORKERS}"
-echo "  Learning rate:  ${LR}"
-echo "  Epochs:         ${EPOCHS}"
-echo "  AMP:            ${USE_AMP}"
-echo "  Eval scales:    ${EVAL_SCALES}"
-echo "  Eval flip:      ${EVAL_FLIP}"
-
-EXTRA_ARGS=()
-if [ "${USE_AMP}" = "0" ]; then
-  EXTRA_ARGS+=(--no-amp)
-else
-  EXTRA_ARGS+=(--amp)
-fi
-
-if [ "${EVAL_FLIP}" = "0" ]; then
-  EXTRA_ARGS+=(--no-eval-flip)
-else
-  EXTRA_ARGS+=(--eval-flip)
-fi
 
 exec "${PYTHON_BIN}" train.py \
   --model-variant "${MODEL_VARIANT}" \
-  --optimizer "${OPTIMIZER}" \
-  --batch-size "${BATCH_SIZE}" \
-  --base-batch-size "${BASE_BATCH_SIZE}" \
   --scale-lr-with-batch \
-  --epochs "${EPOCHS}" \
-  --lr "${LR}" \
-  --weight-decay "${WEIGHT_DECAY}" \
-  --warmup-iters "${WARMUP_ITERS}" \
-  --poly-power "${POLY_POWER}" \
-  --min-lr-ratio "${MIN_LR_RATIO}" \
-  --early-stop-patience "${EARLY_STOP_PATIENCE}" \
-  --early-stop-min-delta "${EARLY_STOP_MIN_DELTA}" \
-  --hflip-prob "${HFLIP_PROB}" \
-  --color-jitter "${COLOR_JITTER}" \
-  --gaussian-blur "${GAUSSIAN_BLUR}" \
-  --ema-decay "${EMA_DECAY}" \
   --num-workers "${NUM_WORKERS}" \
-  --seed "${SEED}" \
-  --dropout "${DROPOUT}" \
-  --eval-scales "${EVAL_SCALES}" \
-  --experiment-id "${EXPERIMENT_ID}" \
-  "${EXTRA_ARGS[@]}"
+  --experiment-id "${EXPERIMENT_ID}"
