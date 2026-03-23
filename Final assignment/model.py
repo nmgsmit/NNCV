@@ -1,8 +1,12 @@
+import math
 import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+LAYER_NORM_EPS = 1e-6
 
 
 class DropPath(nn.Module):
@@ -30,7 +34,7 @@ class OverlapPatchEmbed(nn.Module):
             stride=stride,
             padding=patch_size // 2,
         )
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim, eps=LAYER_NORM_EPS)
 
     def forward(self, x):
         x = self.proj(x)
@@ -41,7 +45,7 @@ class OverlapPatchEmbed(nn.Module):
 
 
 class EfficientSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads=1, sr_ratio=1, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, dim, num_heads=1, sr_ratio=1, qkv_bias=True, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
@@ -50,8 +54,8 @@ class EfficientSelfAttention(nn.Module):
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
-        self.q = nn.Linear(dim, dim)
-        self.kv = nn.Linear(dim, dim * 2)
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -59,7 +63,7 @@ class EfficientSelfAttention(nn.Module):
         self.sr_ratio = sr_ratio
         if sr_ratio > 1:
             self.sr = nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio)
-            self.norm = nn.LayerNorm(dim)
+            self.norm = nn.LayerNorm(dim, eps=LAYER_NORM_EPS)
         else:
             self.sr = None
             self.norm = None
@@ -117,22 +121,24 @@ class TransformerBlock(nn.Module):
         num_heads,
         mlp_ratio=4.0,
         sr_ratio=1,
+        qkv_bias=True,
         attn_drop=0.0,
         proj_drop=0.0,
         mlp_drop=0.0,
         drop_path=0.0,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = nn.LayerNorm(dim, eps=LAYER_NORM_EPS)
         self.attn = EfficientSelfAttention(
             dim,
             num_heads=num_heads,
             sr_ratio=sr_ratio,
+            qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
         )
         self.drop_path = DropPath(drop_path)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim, eps=LAYER_NORM_EPS)
         self.mlp = MixFFN(dim, int(dim * mlp_ratio), drop=mlp_drop)
 
     def forward(self, x, h, w):
@@ -149,6 +155,8 @@ class MixVisionStage(nn.Module):
         depth,
         num_heads,
         sr_ratio,
+        mlp_ratio,
+        qkv_bias,
         patch_size,
         stride,
         drop_path_rates,
@@ -163,7 +171,9 @@ class MixVisionStage(nn.Module):
                 TransformerBlock(
                     embed_dim,
                     num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
                     sr_ratio=sr_ratio,
+                    qkv_bias=qkv_bias,
                     attn_drop=attn_drop,
                     proj_drop=proj_drop,
                     mlp_drop=mlp_drop,
@@ -172,7 +182,7 @@ class MixVisionStage(nn.Module):
                 for i in range(depth)
             ]
         )
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim, eps=LAYER_NORM_EPS)
 
     def forward(self, x):
         x, h, w = self.patch_embed(x)
@@ -191,6 +201,8 @@ class MixVisionTransformerEncoder(nn.Module):
         depths,
         num_heads,
         sr_ratios,
+        mlp_ratios=(4.0, 4.0, 4.0, 4.0),
+        qkv_bias=True,
         attn_drop=0.0,
         proj_drop=0.0,
         mlp_drop=0.0,
@@ -213,6 +225,8 @@ class MixVisionTransformerEncoder(nn.Module):
             depths[0],
             num_heads[0],
             sr_ratios[0],
+            mlp_ratios[0],
+            qkv_bias,
             patch_size=7,
             stride=4,
             drop_path_rates=stage_slices[0],
@@ -226,6 +240,8 @@ class MixVisionTransformerEncoder(nn.Module):
             depths[1],
             num_heads[1],
             sr_ratios[1],
+            mlp_ratios[1],
+            qkv_bias,
             patch_size=3,
             stride=2,
             drop_path_rates=stage_slices[1],
@@ -239,6 +255,8 @@ class MixVisionTransformerEncoder(nn.Module):
             depths[2],
             num_heads[2],
             sr_ratios[2],
+            mlp_ratios[2],
+            qkv_bias,
             patch_size=3,
             stride=2,
             drop_path_rates=stage_slices[2],
@@ -252,6 +270,8 @@ class MixVisionTransformerEncoder(nn.Module):
             depths[3],
             num_heads[3],
             sr_ratios[3],
+            mlp_ratios[3],
+            qkv_bias,
             patch_size=3,
             stride=2,
             drop_path_rates=stage_slices[3],
@@ -259,6 +279,22 @@ class MixVisionTransformerEncoder(nn.Module):
             proj_drop=proj_drop,
             mlp_drop=mlp_drop,
         )
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, (nn.LayerNorm, nn.modules.batchnorm._BatchNorm)):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+        elif isinstance(module, nn.Conv2d):
+            fan_out = module.kernel_size[0] * module.kernel_size[1] * module.out_channels
+            fan_out //= module.groups
+            module.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+            if module.bias is not None:
+                module.bias.data.zero_()
 
     def forward(self, x):
         c1 = self.stage1(x)
@@ -268,36 +304,51 @@ class MixVisionTransformerEncoder(nn.Module):
         return c1, c2, c3, c4
 
 
+class SegFormerMLP(nn.Module):
+    def __init__(self, input_dim, embedding_dim):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, embedding_dim)
+
+    def forward(self, x):
+        x = x.flatten(2).transpose(1, 2)
+        return self.proj(x)
+
+
 class SegFormerHead(nn.Module):
     def __init__(self, in_channels, embedding_dim, n_classes, dropout=0.1):
         super().__init__()
 
-        self.linear_c1 = nn.Conv2d(in_channels[0], embedding_dim, kernel_size=1)
-        self.linear_c2 = nn.Conv2d(in_channels[1], embedding_dim, kernel_size=1)
-        self.linear_c3 = nn.Conv2d(in_channels[2], embedding_dim, kernel_size=1)
-        self.linear_c4 = nn.Conv2d(in_channels[3], embedding_dim, kernel_size=1)
+        self.linear_c1 = SegFormerMLP(in_channels[0], embedding_dim)
+        self.linear_c2 = SegFormerMLP(in_channels[1], embedding_dim)
+        self.linear_c3 = SegFormerMLP(in_channels[2], embedding_dim)
+        self.linear_c4 = SegFormerMLP(in_channels[3], embedding_dim)
 
         self.linear_fuse = nn.Sequential(
             nn.Conv2d(embedding_dim * 4, embedding_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(embedding_dim),
+            nn.SyncBatchNorm(embedding_dim),
             nn.ReLU(inplace=True),
         )
         self.dropout = nn.Dropout2d(dropout)
-        self.classifier = nn.Conv2d(embedding_dim, n_classes, kernel_size=1)
+        self.linear_pred = nn.Conv2d(embedding_dim, n_classes, kernel_size=1)
 
     def forward(self, features):
         c1, c2, c3, c4 = features
+        batch_size = c4.shape[0]
         h, w = c1.shape[-2:]
 
-        c1 = self.linear_c1(c1)
-        c2 = F.interpolate(self.linear_c2(c2), size=(h, w), mode="bilinear", align_corners=False)
-        c3 = F.interpolate(self.linear_c3(c3), size=(h, w), mode="bilinear", align_corners=False)
-        c4 = F.interpolate(self.linear_c4(c4), size=(h, w), mode="bilinear", align_corners=False)
+        c1 = self.linear_c1(c1).permute(0, 2, 1).reshape(batch_size, -1, c1.shape[2], c1.shape[3])
+        c2 = self.linear_c2(c2).permute(0, 2, 1).reshape(batch_size, -1, c2.shape[2], c2.shape[3])
+        c3 = self.linear_c3(c3).permute(0, 2, 1).reshape(batch_size, -1, c3.shape[2], c3.shape[3])
+        c4 = self.linear_c4(c4).permute(0, 2, 1).reshape(batch_size, -1, c4.shape[2], c4.shape[3])
 
-        x = torch.cat([c1, c2, c3, c4], dim=1)
+        c2 = F.interpolate(c2, size=(h, w), mode="bilinear", align_corners=False)
+        c3 = F.interpolate(c3, size=(h, w), mode="bilinear", align_corners=False)
+        c4 = F.interpolate(c4, size=(h, w), mode="bilinear", align_corners=False)
+
+        x = torch.cat([c4, c3, c2, c1], dim=1)
         x = self.linear_fuse(x)
         x = self.dropout(x)
-        return self.classifier(x)
+        return self.linear_pred(x)
 
 
 class Model(nn.Module):
@@ -309,6 +360,8 @@ class Model(nn.Module):
         depths=(3, 6, 40, 3),
         sr_ratios=(8, 4, 2, 1),
         num_heads=(1, 2, 5, 8),
+        mlp_ratios=(4.0, 4.0, 4.0, 4.0),
+        qkv_bias=True,
         decoder_embedding_dim=768,
         dropout=0.1,
         attn_drop=0.0,
@@ -324,6 +377,8 @@ class Model(nn.Module):
             depths=depths,
             num_heads=num_heads,
             sr_ratios=sr_ratios,
+            mlp_ratios=mlp_ratios,
+            qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             mlp_drop=mlp_drop,
@@ -336,6 +391,7 @@ class Model(nn.Module):
             n_classes=n_classes,
             dropout=dropout,
         )
+        self.decode_head.apply(self.encoder._init_weights)
 
     def _extract_checkpoint_state(self, checkpoint):
         if not isinstance(checkpoint, dict):
@@ -384,7 +440,11 @@ class Model(nn.Module):
         key = key.replace(".mlp.dense2", ".mlp.fc2")
         return key
 
-    def load_pretrained(self, folder_path):
+    def init_weights(self, pretrained=None):
+        if pretrained is None:
+            return
+
+        folder_path = pretrained
         weight_path = os.path.join(folder_path, "pytorch_model.bin")
         if not os.path.exists(weight_path):
             raise FileNotFoundError(f"Missing weights at {weight_path}")
@@ -452,10 +512,10 @@ class Model(nn.Module):
             if len(missing_encoder_keys) > preview_count:
                 print("  - ...")
 
-    def forward(self, x):
-        input_size = x.shape[-2:]
-        features = self.encoder(x)
+    def load_pretrained(self, folder_path):
+        self.init_weights(folder_path)
 
+    def forward(self, x):
+        features = self.encoder(x)
         main_logits = self.decode_head(features)
-        main_logits = F.interpolate(main_logits, size=input_size, mode="bilinear", align_corners=False)
         return main_logits

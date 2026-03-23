@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
-from torch.optim import AdamW, SGD
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import Cityscapes
 from torchvision.transforms import InterpolationMode
@@ -27,9 +27,26 @@ from model import Model
 IGNORE_INDEX = 255
 DATA_DIR = "./data/cityscapes"
 NUM_CLASSES = 19
-DEFAULT_TRAIN_SIZE = (512, 1024)
+IMAGE_SIZE = (512, 1024)
 CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
 CITYSCAPES_STD = (0.229, 0.224, 0.225)
+BATCH_SIZE = 4
+EPOCHS = 80
+LR = 6e-5
+WEIGHT_DECAY = 1e-2
+WARMUP_ITERS = 1500
+POLY_POWER = 0.9
+MIN_LR_RATIO = 1e-3
+EARLY_STOP_PATIENCE = 12
+EARLY_STOP_MIN_DELTA = 1e-4
+HFLIP_PROB = 0.5
+COLOR_JITTER = 0.4
+GAUSSIAN_BLUR = 0.0
+EMA_DECAY = 0.999
+SEED = 42
+DROPOUT = 0.1
+EVAL_SCALES = (0.75, 1.0, 1.25)
+EVAL_FLIP = True
 MODEL_CONFIGS = {
     "b0": {
         "embed_dims": (32, 64, 160, 256),
@@ -90,10 +107,15 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
+def default_num_workers() -> int:
+    cpu_count = os.cpu_count() or 8
+    return min(cpu_count, 12)
+
+
 class CityscapesJointTransform:
     def __init__(
         self,
-        image_size=DEFAULT_TRAIN_SIZE,
+        image_size=IMAGE_SIZE,
         training=True,
         hflip_prob=0.5,
         color_jitter=0.4,
@@ -262,29 +284,15 @@ def compute_mean_dice(confmat):
     return dice.mean().item()
 
 
-def parse_eval_scales(scales) -> tuple[float, ...]:
-    values = scales if isinstance(scales, (list, tuple)) else str(scales).split(",")
-    parsed = []
-    for value in values:
-        scale = float(str(value).strip())
-        if scale <= 0.0:
-            raise ValueError(f"Evaluation scales must be positive, got {scale}.")
-        parsed.append(scale)
-
-    if not parsed:
-        raise ValueError("At least one evaluation scale must be provided.")
-    return tuple(parsed)
-
-
 def autocast_context(enabled: bool):
     if enabled:
         return torch.amp.autocast("cuda", dtype=torch.float16)
     return nullcontext()
 
-
-def forward_main_logits(model: nn.Module, images: torch.Tensor) -> torch.Tensor:
-    outputs = model(images)
-    return outputs[0] if isinstance(outputs, tuple) else outputs
+def resize_logits(logits: torch.Tensor, target_size: tuple[int, int]) -> torch.Tensor:
+    if logits.shape[-2:] == target_size:
+        return logits
+    return F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
 
 
 def multi_scale_inference(
@@ -314,8 +322,8 @@ def multi_scale_inference(
             )
 
         with autocast_context(amp_enabled):
-            logits = forward_main_logits(model, scaled_images)
-        logits = F.interpolate(logits.float(), size=target_size, mode="bilinear", align_corners=False)
+            logits = model(scaled_images)
+        logits = resize_logits(logits.float(), target_size)
 
         fused_logits = logits if fused_logits is None else fused_logits + logits
         num_predictions += 1
@@ -323,7 +331,7 @@ def multi_scale_inference(
         if flip:
             flipped_images = torch.flip(scaled_images, dims=[3])
             with autocast_context(amp_enabled):
-                flipped_logits = forward_main_logits(model, flipped_images)
+                flipped_logits = model(flipped_images)
             flipped_logits = torch.flip(flipped_logits, dims=[3])
             flipped_logits = F.interpolate(
                 flipped_logits.float(),
@@ -346,43 +354,16 @@ def get_args_parser():
         choices=tuple(MODEL_CONFIGS),
         help="SegFormer backbone preset to use",
     )
-    parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd", "adamw"], help="Optimizer type")
-    parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
-    parser.add_argument("--base-batch-size", type=int, default=4, help="Reference batch size used for LR scaling")
-    parser.add_argument("--scale-lr-with-batch", action="store_true", help="Scale LR linearly with batch size")
-    parser.add_argument("--epochs", type=int, default=80, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=6e-5, help="Base learning rate")
-    parser.add_argument("--momentum", type=float, default=0.9, help="Momentum for SGD")
-    parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay")
-    parser.add_argument("--warmup-iters", type=int, default=1500, help="Linear warmup iterations")
-    parser.add_argument("--poly-power", type=float, default=0.9, help="Power for poly learning rate schedule")
-    parser.add_argument("--min-lr-ratio", type=float, default=0.0, help="Minimum LR as a ratio of base LR")
-    parser.add_argument("--early-stop-patience", type=int, default=10, help="Number of epochs without validation improvement before stopping")
-    parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
-    parser.add_argument("--hflip-prob", type=float, default=0.5, help="Horizontal flip probability for training augmentation")
-    parser.add_argument("--color-jitter", type=float, default=0.4, help="Color jitter strength (0 disables)")
-    parser.add_argument("--gaussian-blur", type=float, default=0.0, help="Probability of Gaussian blur (0 disables)")
-    parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for evaluation model (<=0 disables EMA)")
-    parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--eval-scales", type=str, default="0.75,1.0,1.25", help="Comma-separated multi-scale validation factors")
-    parser.add_argument("--eval-flip", dest="eval_flip", action="store_true", help="Enable horizontal flip during validation TTA")
-    parser.add_argument("--no-eval-flip", dest="eval_flip", action="store_false", help="Disable horizontal flip during validation TTA")
-    parser.set_defaults(eval_flip=True)
-    parser.add_argument("--amp", dest="amp", action="store_true", help="Enable CUDA AMP training/inference")
-    parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA AMP training/inference")
-    parser.set_defaults(amp=True)
     parser.add_argument(
         "--experiment-id",
         type=str,
         default=None,
         help="Experiment ID for Weights & Biases; defaults to segformer-<model-variant>",
     )
-    parser.add_argument("--dropout", type=float, default=0.1, help="Decoder dropout rate for SegFormer")
     return parser
 
 
-def build_model_from_variant(variant: str, dropout: float) -> Model:
+def build_model_from_variant(variant: str) -> Model:
     try:
         config = MODEL_CONFIGS[variant]
     except KeyError as exc:
@@ -391,7 +372,7 @@ def build_model_from_variant(variant: str, dropout: float) -> Model:
     return Model(
         in_channels=3,
         n_classes=NUM_CLASSES,
-        dropout=dropout,
+        dropout=DROPOUT,
         drop_path_rate=0.1,
         **config,
     )
@@ -399,16 +380,19 @@ def build_model_from_variant(variant: str, dropout: float) -> Model:
 
 def main(args):
     pretrained_path = f"./mit-{args.model_variant}"
-    eval_scales = parse_eval_scales(args.eval_scales)
-    experiment_id = args.experiment_id or f"segformer-{args.model_variant}-ce-amp"
-    amp_enabled = args.amp and torch.cuda.is_available()
+    experiment_id = args.experiment_id or f"segformer-{args.model_variant}"
+    amp_enabled = torch.cuda.is_available()
+    num_workers = default_num_workers()
 
     wandb.init(
         project="5lsm0-cityscapes-segmentation",
         name=experiment_id,
         config={
-            **vars(args),
-            "eval_scales": list(eval_scales),
+            "model_variant": args.model_variant,
+            "batch_size": BATCH_SIZE,
+            "epochs": EPOCHS,
+            "lr": LR,
+            "eval_scales": list(EVAL_SCALES),
             "amp_enabled": amp_enabled,
         },
     )
@@ -416,22 +400,22 @@ def main(args):
     output_dir = os.path.join("checkpoints", experiment_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
+    torch.manual_seed(SEED)
+    random.seed(SEED)
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     train_transform = CityscapesJointTransform(
-        image_size=DEFAULT_TRAIN_SIZE,
+        image_size=IMAGE_SIZE,
         training=True,
-        hflip_prob=args.hflip_prob,
-        color_jitter=args.color_jitter,
-        gaussian_blur=args.gaussian_blur,
+        hflip_prob=HFLIP_PROB,
+        color_jitter=COLOR_JITTER,
+        gaussian_blur=GAUSSIAN_BLUR,
     )
     valid_transform = CityscapesJointTransform(
-        image_size=DEFAULT_TRAIN_SIZE,
+        image_size=IMAGE_SIZE,
         training=False,
         hflip_prob=0.0,
         color_jitter=0.0,
@@ -441,12 +425,12 @@ def main(args):
     train_dataset = CityscapesSegmentationDataset(DATA_DIR, split="train", transform=train_transform)
     valid_dataset = CityscapesSegmentationDataset(DATA_DIR, split="val", transform=valid_transform)
 
-    persistent_workers = args.num_workers > 0
+    persistent_workers = num_workers > 0
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
         persistent_workers=persistent_workers,
@@ -454,15 +438,15 @@ def main(args):
     )
     valid_dataloader = DataLoader(
         valid_dataset,
-        batch_size=args.batch_size,
+        batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
         persistent_workers=persistent_workers,
         worker_init_fn=seed_worker,
     )
 
-    model = build_model_from_variant(args.model_variant, args.dropout).to(device)
+    model = build_model_from_variant(args.model_variant).to(device)
 
     try:
         model.load_pretrained(pretrained_path)
@@ -471,7 +455,7 @@ def main(args):
         print("Training from scratch...")
 
     ema_model = None
-    if args.ema_decay > 0.0:
+    if EMA_DECAY > 0.0:
         ema_model = copy.deepcopy(model).to(device)
         ema_model.eval()
         for p in ema_model.parameters():
@@ -479,28 +463,15 @@ def main(args):
 
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
 
-    lr_scale = 1.0
-    if args.scale_lr_with_batch:
-        lr_scale = float(args.batch_size) / float(max(args.base_batch_size, 1))
-    effective_base_lr = args.lr * lr_scale
-
-    if args.optimizer == "adamw":
-        optimizer = AdamW(
-            model.parameters(),
-            lr=effective_base_lr,
-            weight_decay=args.weight_decay,
-        )
-    else:
-        optimizer = SGD(
-            model.parameters(),
-            lr=effective_base_lr,
-            momentum=args.momentum,
-            weight_decay=args.weight_decay,
-        )
+    optimizer = AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     global_iter = 0
-    total_iters = args.epochs * len(train_dataloader)
+    total_iters = EPOCHS * len(train_dataloader)
 
     best_dice = -float("inf")
     best_miou = -float("inf")
@@ -508,8 +479,8 @@ def main(args):
     epochs_without_improvement = 0
     best_model_path = os.path.join(output_dir, "best_model.pt")
 
-    for epoch in range(args.epochs):
-        print(f"Epoch {epoch + 1:04}/{args.epochs:04}")
+    for epoch in range(EPOCHS):
+        print(f"Epoch {epoch + 1:04}/{EPOCHS:04}")
 
         model.train()
         train_loss_total = 0.0
@@ -520,12 +491,12 @@ def main(args):
             labels = labels.to(device, non_blocking=True).long().squeeze(1)
 
             current_lr = poly_lr(
-                base_lr=effective_base_lr,
+                base_lr=LR,
                 current_iter=global_iter,
                 max_iter=total_iters,
-                warmup_iters=args.warmup_iters,
-                power=args.poly_power,
-                min_lr_ratio=args.min_lr_ratio,
+                warmup_iters=WARMUP_ITERS,
+                power=POLY_POWER,
+                min_lr_ratio=MIN_LR_RATIO,
             )
             for param_group in optimizer.param_groups:
                 param_group["lr"] = current_lr
@@ -533,6 +504,7 @@ def main(args):
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(amp_enabled):
                 logits = model(images)
+                logits = resize_logits(logits, labels.shape[-2:])
                 loss = criterion(logits, labels)
 
             if not torch.isfinite(loss):
@@ -545,7 +517,7 @@ def main(args):
             scaler.update()
 
             if ema_model is not None:
-                update_ema_model(ema_model, model, args.ema_decay)
+                update_ema_model(ema_model, model, EMA_DECAY)
 
             train_loss_total += loss.item()
             wandb.log(
@@ -574,8 +546,8 @@ def main(args):
                 outputs = multi_scale_inference(
                     eval_model,
                     images,
-                    scales=eval_scales,
-                    flip=args.eval_flip,
+                    scales=EVAL_SCALES,
+                    flip=EVAL_FLIP,
                     amp_enabled=amp_enabled,
                 )
 
@@ -615,7 +587,7 @@ def main(args):
                 step=global_iter - 1,
             )
 
-            if valid_mean_dice > best_dice + args.early_stop_min_delta:
+            if valid_mean_dice > best_dice + EARLY_STOP_MIN_DELTA:
                 best_dice = valid_mean_dice
                 best_miou = valid_miou
                 best_valid_loss = valid_loss
@@ -624,10 +596,10 @@ def main(args):
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
-                if epochs_without_improvement >= args.early_stop_patience:
+                if epochs_without_improvement >= EARLY_STOP_PATIENCE:
                     print(
                         f"Early stopping at epoch {epoch + 1}: "
-                        f"no Dice improvement for {args.early_stop_patience} epochs."
+                        f"no Dice improvement for {EARLY_STOP_PATIENCE} epochs."
                     )
                     break
 
