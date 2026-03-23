@@ -21,13 +21,14 @@ from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F_v2
 from torchvision.utils import make_grid
 
-from model import SEGFORMER_CONFIGS, build_model
+from model import Model
 
 
 IGNORE_INDEX = 255
 DEFAULT_TRAIN_SIZE = (512, 1024)
 CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
 CITYSCAPES_STD = (0.229, 0.224, 0.225)
+MODEL_VARIANTS = ("b0", "b5")
 
 
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -326,7 +327,7 @@ def get_args_parser():
         "--model-variant",
         type=str,
         default="b5",
-        choices=sorted(SEGFORMER_CONFIGS),
+        choices=MODEL_VARIANTS,
         help="SegFormer backbone preset to use",
     )
     parser.add_argument(
@@ -375,6 +376,34 @@ def resolve_pretrained_path(args):
     if args.pretrained_path is not None:
         return args.pretrained_path
     return f"./mit-{args.model_variant}"
+
+
+def build_model_from_variant(variant: str, dropout: float) -> Model:
+    if variant == "b0":
+        return Model(
+            in_channels=3,
+            n_classes=19,
+            embed_dims=(32, 64, 160, 256),
+            depths=(2, 2, 2, 2),
+            sr_ratios=(8, 4, 2, 1),
+            num_heads=(1, 2, 5, 8),
+            decoder_embedding_dim=256,
+            dropout=dropout,
+            drop_path_rate=0.1,
+        )
+    if variant == "b5":
+        return Model(
+            in_channels=3,
+            n_classes=19,
+            embed_dims=(64, 128, 320, 512),
+            depths=(3, 6, 40, 3),
+            sr_ratios=(8, 4, 2, 1),
+            num_heads=(1, 2, 5, 8),
+            decoder_embedding_dim=768,
+            dropout=dropout,
+            drop_path_rate=0.1,
+        )
+    raise ValueError(f"Unknown model variant '{variant}'. Expected one of: {', '.join(MODEL_VARIANTS)}")
 
 
 def main(args):
@@ -442,12 +471,7 @@ def main(args):
         worker_init_fn=seed_worker,
     )
 
-    model = build_model(
-        variant=args.model_variant,
-        in_channels=3,
-        n_classes=19,
-        dropout=args.dropout,
-    ).to(device)
+    model = build_model_from_variant(args.model_variant, args.dropout).to(device)
 
     try:
         model.load_pretrained(pretrained_path)

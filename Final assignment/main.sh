@@ -25,11 +25,11 @@ fi
 rm -rf __pycache__
 
 "${PYTHON_BIN}" - <<'PY'
-from model import SEGFORMER_CONFIGS, build_model
+from model import Model
 
 print("Preflight import OK:")
-print("  SegFormer variants:", ", ".join(sorted(SEGFORMER_CONFIGS)))
-print("  Builder:", build_model.__name__)
+print("  Model class:", Model.__name__)
+print("  Supported variants: b0, b5")
 PY
 
 DEFAULT_WORKERS=8

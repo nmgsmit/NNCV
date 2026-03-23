@@ -5,26 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-SEGFORMER_CONFIGS = {
-    "b0": {
-        "embed_dims": (32, 64, 160, 256),
-        "depths": (2, 2, 2, 2),
-        "sr_ratios": (8, 4, 2, 1),
-        "num_heads": (1, 2, 5, 8),
-        "decoder_embedding_dim": 256,
-        "drop_path_rate": 0.1,
-    },
-    "b5": {
-        "embed_dims": (64, 128, 320, 512),
-        "depths": (3, 6, 40, 3),
-        "sr_ratios": (8, 4, 2, 1),
-        "num_heads": (1, 2, 5, 8),
-        "decoder_embedding_dim": 768,
-        "drop_path_rate": 0.1,
-    },
-}
-
-
 class DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
         super().__init__()
@@ -479,13 +459,3 @@ class Model(nn.Module):
         main_logits = self.decode_head(features)
         main_logits = F.interpolate(main_logits, size=input_size, mode="bilinear", align_corners=False)
         return main_logits
-
-
-def build_model(variant="b0", **overrides):
-    if variant not in SEGFORMER_CONFIGS:
-        available = ", ".join(sorted(SEGFORMER_CONFIGS))
-        raise ValueError(f"Unknown SegFormer variant '{variant}'. Available variants: {available}")
-
-    config = dict(SEGFORMER_CONFIGS[variant])
-    config.update(overrides)
-    return Model(**config)
