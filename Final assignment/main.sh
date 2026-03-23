@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODEL_VARIANT=${MODEL_VARIANT:-b5}
 BACKBONE_NAME=${BACKBONE_NAME:-"MiT-${MODEL_VARIANT}"}
-EXPERIMENT_ID=${EXPERIMENT_ID:-"SegFormer-${MODEL_VARIANT}-dice-amp-msflip"}
+EXPERIMENT_ID=${EXPERIMENT_ID:-"SegFormer-${MODEL_VARIANT}-ce-amp-msflip"}
 
 if command -v python3 >/dev/null 2>&1; then
   PYTHON_BIN=python3
@@ -52,12 +52,6 @@ WEIGHT_DECAY=${WEIGHT_DECAY:-1e-2}
 WARMUP_ITERS=${WARMUP_ITERS:-1500}
 POLY_POWER=${POLY_POWER:-0.9}
 MIN_LR_RATIO=${MIN_LR_RATIO:-1e-3}
-OHEM_THRESH=${OHEM_THRESH:-0.7}
-OHEM_MIN_KEPT=${OHEM_MIN_KEPT:-131072}
-AUX_WEIGHT=${AUX_WEIGHT:-0.2}
-AUX_DICE_WEIGHT=${AUX_DICE_WEIGHT:-0.2}
-DICE_WEIGHT=${DICE_WEIGHT:-1.0}
-LABEL_SMOOTHING=${LABEL_SMOOTHING:-0.0}
 EARLY_STOP_PATIENCE=${EARLY_STOP_PATIENCE:-12}
 EARLY_STOP_MIN_DELTA=${EARLY_STOP_MIN_DELTA:-1e-4}
 HFLIP_PROB=${HFLIP_PROB:-0.5}
@@ -112,12 +106,6 @@ exec "${PYTHON_BIN}" train.py \
   --warmup-iters "${WARMUP_ITERS}" \
   --poly-power "${POLY_POWER}" \
   --min-lr-ratio "${MIN_LR_RATIO}" \
-  --ohem-thresh "${OHEM_THRESH}" \
-  --ohem-min-kept "${OHEM_MIN_KEPT}" \
-  --aux-weight "${AUX_WEIGHT}" \
-  --aux-dice-weight "${AUX_DICE_WEIGHT}" \
-  --dice-weight "${DICE_WEIGHT}" \
-  --label-smoothing "${LABEL_SMOOTHING}" \
   --early-stop-patience "${EARLY_STOP_PATIENCE}" \
   --early-stop-min-delta "${EARLY_STOP_MIN_DELTA}" \
   --hflip-prob "${HFLIP_PROB}" \

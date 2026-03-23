@@ -357,13 +357,6 @@ class Model(nn.Module):
             dropout=dropout,
         )
 
-        self.aux_head = nn.Sequential(
-            nn.Conv2d(embed_dims[2], embed_dims[2], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(embed_dims[2]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(embed_dims[2], n_classes, kernel_size=1),
-        )
-
     def _extract_checkpoint_state(self, checkpoint):
         if not isinstance(checkpoint, dict):
             raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)}")
@@ -484,13 +477,7 @@ class Model(nn.Module):
         features = self.encoder(x)
 
         main_logits = self.decode_head(features)
-        aux_logits = self.aux_head(features[2])
-
         main_logits = F.interpolate(main_logits, size=input_size, mode="bilinear", align_corners=False)
-        aux_logits = F.interpolate(aux_logits, size=input_size, mode="bilinear", align_corners=False)
-
-        if self.training:
-            return main_logits, aux_logits
         return main_logits
 
 

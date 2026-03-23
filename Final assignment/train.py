@@ -170,72 +170,6 @@ class CityscapesSegmentationDataset(Dataset):
         return self.transform(image, target)
 
 
-class OHEMCrossEntropyLoss(nn.Module):
-    def __init__(self, ignore_index=IGNORE_INDEX, thresh=0.7, min_kept=131072, label_smoothing=0.0):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.thresh = thresh
-        self.min_kept = min_kept
-        self.label_smoothing = label_smoothing
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-        pixel_losses = nn.functional.cross_entropy(
-            logits,
-            target,
-            ignore_index=self.ignore_index,
-            label_smoothing=self.label_smoothing,
-            reduction="none",
-        )
-
-        valid_mask = target != self.ignore_index
-        valid_losses = pixel_losses[valid_mask]
-        if valid_losses.numel() == 0:
-            return pixel_losses.mean()
-
-        with torch.no_grad():
-            sorted_losses, _ = torch.sort(valid_losses, descending=True)
-            if sorted_losses.numel() > self.min_kept:
-                dynamic_thresh = sorted_losses[self.min_kept - 1]
-                threshold = max(dynamic_thresh.item(), self.thresh)
-            else:
-                threshold = self.thresh
-
-        hard_losses = valid_losses[valid_losses >= threshold]
-        if hard_losses.numel() == 0:
-            hard_losses = valid_losses
-        return hard_losses.mean()
-
-
-class DiceLoss(nn.Module):
-    def __init__(self, ignore_index=IGNORE_INDEX, eps=1e-6):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.eps = eps
-
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        n_classes = logits.shape[1]
-        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=1e4, neginf=-1e4)
-        probs = torch.softmax(logits, dim=1)
-        probs = torch.nan_to_num(probs, nan=0.0, posinf=1.0, neginf=0.0)
-
-        valid_mask = target != self.ignore_index
-        target_safe = target.clone()
-        target_safe[~valid_mask] = 0
-
-        target_one_hot = nn.functional.one_hot(target_safe, num_classes=n_classes).permute(0, 3, 1, 2).float()
-        valid_mask = valid_mask.unsqueeze(1).float()
-
-        probs = probs * valid_mask
-        target_one_hot = target_one_hot * valid_mask
-
-        intersection = (probs * target_one_hot).sum(dim=(0, 2, 3))
-        denominator = probs.sum(dim=(0, 2, 3)) + target_one_hot.sum(dim=(0, 2, 3))
-
-        dice = (2.0 * intersection + self.eps) / (denominator + self.eps)
-        return 1.0 - dice.mean()
-
-
 def poly_lr(
     base_lr: float,
     current_iter: int,
@@ -412,12 +346,6 @@ def get_args_parser():
     parser.add_argument("--warmup-iters", type=int, default=1500, help="Linear warmup iterations")
     parser.add_argument("--poly-power", type=float, default=0.9, help="Power for poly learning rate schedule")
     parser.add_argument("--min-lr-ratio", type=float, default=0.0, help="Minimum LR as a ratio of base LR")
-    parser.add_argument("--ohem-thresh", type=float, default=0.7, help="OHEM threshold")
-    parser.add_argument("--ohem-min-kept", type=int, default=131072, help="Minimum hard pixels for OHEM")
-    parser.add_argument("--aux-weight", type=float, default=0.2, help="Weight for auxiliary OHEM loss")
-    parser.add_argument("--aux-dice-weight", type=float, default=0.2, help="Weight for auxiliary dice loss")
-    parser.add_argument("--dice-weight", type=float, default=1.0, help="Weight for dice loss")
-    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing for OHEM cross-entropy")
     parser.add_argument("--early-stop-patience", type=int, default=10, help="Number of epochs without validation improvement before stopping")
     parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum validation improvement to reset early stopping")
     parser.add_argument("--hflip-prob", type=float, default=0.5, help="Horizontal flip probability for training augmentation")
@@ -452,7 +380,7 @@ def resolve_pretrained_path(args):
 def main(args):
     pretrained_path = resolve_pretrained_path(args)
     eval_scales = parse_eval_scales(args.eval_scales)
-    experiment_id = args.experiment_id or f"segformer-{args.model_variant}-dice-amp"
+    experiment_id = args.experiment_id or f"segformer-{args.model_variant}-ce-amp"
     amp_enabled = args.amp and torch.cuda.is_available()
 
     wandb.init(
@@ -534,13 +462,7 @@ def main(args):
         for p in ema_model.parameters():
             p.requires_grad = False
 
-    ohem_criterion = OHEMCrossEntropyLoss(
-        ignore_index=IGNORE_INDEX,
-        thresh=args.ohem_thresh,
-        min_kept=args.ohem_min_kept,
-        label_smoothing=args.label_smoothing,
-    )
-    dice_criterion = DiceLoss(ignore_index=IGNORE_INDEX)
+    criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
 
     lr_scale = 1.0
     if args.scale_lr_with_batch:
@@ -595,25 +517,8 @@ def main(args):
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(amp_enabled):
-                outputs = model(images)
-                main_logits, aux_logits = outputs if isinstance(outputs, tuple) else (outputs, None)
-
-                loss_main = ohem_criterion(main_logits, labels)
-                loss_aux = (
-                    ohem_criterion(aux_logits, labels)
-                    if aux_logits is not None else torch.tensor(0.0, device=device)
-                )
-                loss_dice = dice_criterion(main_logits, labels)
-                loss_aux_dice = (
-                    dice_criterion(aux_logits, labels)
-                    if aux_logits is not None else torch.tensor(0.0, device=device)
-                )
-                loss = (
-                    loss_main
-                    + args.aux_weight * loss_aux
-                    + args.dice_weight * loss_dice
-                    + args.aux_dice_weight * loss_aux_dice
-                )
+                logits = model(images)
+                loss = criterion(logits, labels)
 
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite loss encountered; try lowering the learning rate.")
@@ -631,10 +536,6 @@ def main(args):
             wandb.log(
                 {
                     "train_loss": loss.item(),
-                    "train_loss_main": loss_main.item(),
-                    "train_loss_aux": loss_aux.item(),
-                    "train_loss_dice": loss_dice.item(),
-                    "train_loss_aux_dice": loss_aux_dice.item(),
                     "learning_rate": current_lr,
                     "epoch": epoch + 1,
                 },
@@ -663,11 +564,8 @@ def main(args):
                     amp_enabled=amp_enabled,
                 )
 
-                loss_main = ohem_criterion(outputs, labels)
-                loss_dice = dice_criterion(outputs, labels)
-                loss_total = loss_main + args.dice_weight * loss_dice
-
-                valid_losses_total.append(loss_total.item())
+                loss = criterion(outputs, labels)
+                valid_losses_total.append(loss.item())
                 update_confusion_matrix(confmat, outputs, labels, num_classes=19)
 
                 if i == 0:
