@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_VARIANT=${MODEL_VARIANT:-b5}
-BACKBONE_NAME=${BACKBONE_NAME:-"MiT-${MODEL_VARIANT}"}
+# Choose the SegFormer backbone here: b0 or b5.
+MODEL_VARIANT=b5
 EXPERIMENT_ID=${EXPERIMENT_ID:-"SegFormerv4.1"}
 
 if command -v python3 >/dev/null 2>&1; then
@@ -40,9 +40,6 @@ fi
 NUM_WORKERS=${NUM_WORKERS:-$DEFAULT_WORKERS}
 NUM_WORKERS=$(( NUM_WORKERS > 12 ? 12 : NUM_WORKERS ))
 
-DATA_DIR=${DATA_DIR:-./data/cityscapes}
-PRETRAINED_PATH=${PRETRAINED_PATH:-./mit-${MODEL_VARIANT}}
-
 OPTIMIZER=${OPTIMIZER:-adamw}
 BATCH_SIZE=${BATCH_SIZE:-4}
 BASE_BATCH_SIZE=${BASE_BATCH_SIZE:-4}
@@ -66,10 +63,7 @@ EVAL_FLIP=${EVAL_FLIP:-1}
 
 echo "Launching training with:"
 echo "  Python:         ${PYTHON_BIN}"
-echo "  Data dir:       ${DATA_DIR}"
 echo "  Model variant:  ${MODEL_VARIANT}"
-echo "  Backbone:       ${BACKBONE_NAME}"
-echo "  Pretrained:     ${PRETRAINED_PATH}"
 echo "  Experiment:     ${EXPERIMENT_ID}"
 echo "  Batch size:     ${BATCH_SIZE}"
 echo "  Workers:        ${NUM_WORKERS}"
@@ -93,9 +87,7 @@ else
 fi
 
 exec "${PYTHON_BIN}" train.py \
-  --data-dir "${DATA_DIR}" \
   --model-variant "${MODEL_VARIANT}" \
-  --pretrained-path "${PRETRAINED_PATH}" \
   --optimizer "${OPTIMIZER}" \
   --batch-size "${BATCH_SIZE}" \
   --base-batch-size "${BASE_BATCH_SIZE}" \

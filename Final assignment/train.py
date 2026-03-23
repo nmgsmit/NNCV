@@ -25,10 +25,27 @@ from model import Model
 
 
 IGNORE_INDEX = 255
+DATA_DIR = "./data/cityscapes"
+NUM_CLASSES = 19
 DEFAULT_TRAIN_SIZE = (512, 1024)
 CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
 CITYSCAPES_STD = (0.229, 0.224, 0.225)
-MODEL_VARIANTS = ("b0", "b5")
+MODEL_CONFIGS = {
+    "b0": {
+        "embed_dims": (32, 64, 160, 256),
+        "depths": (2, 2, 2, 2),
+        "sr_ratios": (8, 4, 2, 1),
+        "num_heads": (1, 2, 5, 8),
+        "decoder_embedding_dim": 256,
+    },
+    "b5": {
+        "embed_dims": (64, 128, 320, 512),
+        "depths": (3, 6, 40, 3),
+        "sr_ratios": (8, 4, 2, 1),
+        "num_heads": (1, 2, 5, 8),
+        "decoder_embedding_dim": 768,
+    },
+}
 
 
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -322,19 +339,12 @@ def multi_scale_inference(
 
 def get_args_parser():
     parser = ArgumentParser("Training script for SegFormer on Cityscapes")
-    parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
     parser.add_argument(
         "--model-variant",
         type=str,
         default="b5",
-        choices=MODEL_VARIANTS,
+        choices=tuple(MODEL_CONFIGS),
         help="SegFormer backbone preset to use",
-    )
-    parser.add_argument(
-        "--pretrained-path",
-        type=str,
-        default=None,
-        help="Path to pretrained weights folder; defaults to ./mit-<model-variant>",
     )
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["sgd", "adamw"], help="Optimizer type")
     parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
@@ -372,42 +382,23 @@ def get_args_parser():
     return parser
 
 
-def resolve_pretrained_path(args):
-    if args.pretrained_path is not None:
-        return args.pretrained_path
-    return f"./mit-{args.model_variant}"
-
-
 def build_model_from_variant(variant: str, dropout: float) -> Model:
-    if variant == "b0":
-        return Model(
-            in_channels=3,
-            n_classes=19,
-            embed_dims=(32, 64, 160, 256),
-            depths=(2, 2, 2, 2),
-            sr_ratios=(8, 4, 2, 1),
-            num_heads=(1, 2, 5, 8),
-            decoder_embedding_dim=256,
-            dropout=dropout,
-            drop_path_rate=0.1,
-        )
-    if variant == "b5":
-        return Model(
-            in_channels=3,
-            n_classes=19,
-            embed_dims=(64, 128, 320, 512),
-            depths=(3, 6, 40, 3),
-            sr_ratios=(8, 4, 2, 1),
-            num_heads=(1, 2, 5, 8),
-            decoder_embedding_dim=768,
-            dropout=dropout,
-            drop_path_rate=0.1,
-        )
-    raise ValueError(f"Unknown model variant '{variant}'. Expected one of: {', '.join(MODEL_VARIANTS)}")
+    try:
+        config = MODEL_CONFIGS[variant]
+    except KeyError as exc:
+        raise ValueError(f"Unknown model variant '{variant}'. Expected one of: {', '.join(MODEL_CONFIGS)}") from exc
+
+    return Model(
+        in_channels=3,
+        n_classes=NUM_CLASSES,
+        dropout=dropout,
+        drop_path_rate=0.1,
+        **config,
+    )
 
 
 def main(args):
-    pretrained_path = resolve_pretrained_path(args)
+    pretrained_path = f"./mit-{args.model_variant}"
     eval_scales = parse_eval_scales(args.eval_scales)
     experiment_id = args.experiment_id or f"segformer-{args.model_variant}-ce-amp"
     amp_enabled = args.amp and torch.cuda.is_available()
@@ -447,8 +438,8 @@ def main(args):
         gaussian_blur=0.0,
     )
 
-    train_dataset = CityscapesSegmentationDataset(args.data_dir, split="train", transform=train_transform)
-    valid_dataset = CityscapesSegmentationDataset(args.data_dir, split="val", transform=valid_transform)
+    train_dataset = CityscapesSegmentationDataset(DATA_DIR, split="train", transform=train_transform)
+    valid_dataset = CityscapesSegmentationDataset(DATA_DIR, split="val", transform=valid_transform)
 
     persistent_workers = args.num_workers > 0
     train_dataloader = DataLoader(
@@ -573,7 +564,7 @@ def main(args):
 
         with torch.no_grad():
             valid_losses_total = []
-            confmat = torch.zeros((19, 19), dtype=torch.int64, device=device)
+            confmat = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.int64, device=device)
 
             for i, (images, labels) in enumerate(valid_dataloader):
                 labels = convert_to_train_id(labels)
@@ -590,7 +581,7 @@ def main(args):
 
                 loss = criterion(outputs, labels)
                 valid_losses_total.append(loss.item())
-                update_confusion_matrix(confmat, outputs, labels, num_classes=19)
+                update_confusion_matrix(confmat, outputs, labels, num_classes=NUM_CLASSES)
 
                 if i == 0:
                     predictions = outputs.argmax(1, keepdim=True)
