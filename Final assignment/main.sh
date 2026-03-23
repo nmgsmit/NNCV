@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODEL_VARIANT=${MODEL_VARIANT:-b5}
 BACKBONE_NAME=${BACKBONE_NAME:-"MiT-${MODEL_VARIANT}"}
-EXPERIMENT_ID=${EXPERIMENT_ID:-"SegFormer-${MODEL_VARIANT}-ce-amp-msflip"}
+EXPERIMENT_ID=${EXPERIMENT_ID:-"SegFormerv4.1"}
 
 if command -v python3 >/dev/null 2>&1; then
   PYTHON_BIN=python3
