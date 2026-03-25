@@ -5,10 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-MODEL_NAME = "segformer-step3-efficient-attention"
+MODEL_NAME = "segformer-step4-mix-ffn"
 MODEL_DESCRIPTION = (
-    "Step 3: the single-stage transformer now uses overlap patch embedding and efficient "
-    "self-attention, while still keeping a plain FFN and a simple decoder."
+    "Step 4: the single-stage transformer now combines overlap patch embedding, efficient "
+    "self-attention, and Mix-FFN, while still using a simple decoder."
 )
 LAYER_NORM_EPS = 1e-6
 
@@ -18,7 +18,7 @@ MODEL_CONFIG = {
     "single_stage": {
         "patch_embed_type": "overlap",
         "attention_type": "efficient",
-        "ffn_type": "plain",
+        "ffn_type": "mix",
         "embed_dim": 256,
         "depth": 6,
         "num_heads": 8,
