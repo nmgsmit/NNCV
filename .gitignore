@@ -2,6 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
+local_data/
+local_output/
+Final assignment/model.pt
+Final assignment/.env
 
 # C extensions
 *.so

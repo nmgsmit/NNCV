@@ -56,6 +56,42 @@ def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
     return color_image
 
 
+def update_confusion_matrix(
+    confusion_matrix: torch.Tensor,
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int = 19,
+    ignore_index: int = 255,
+) -> None:
+    valid_mask = labels != ignore_index
+    predictions = predictions[valid_mask]
+    labels = labels[valid_mask]
+
+    if predictions.numel() == 0:
+        return
+
+    indices = labels * num_classes + predictions
+    confusion_matrix += torch.bincount(
+        indices,
+        minlength=num_classes * num_classes,
+    ).reshape(num_classes, num_classes)
+
+
+def compute_mean_dice(confusion_matrix: torch.Tensor) -> float:
+    intersections = torch.diag(confusion_matrix).to(torch.float64)
+    predicted_areas = confusion_matrix.sum(dim=0).to(torch.float64)
+    label_areas = confusion_matrix.sum(dim=1).to(torch.float64)
+
+    denominators = predicted_areas + label_areas
+    present_classes = denominators > 0
+
+    if not torch.any(present_classes):
+        return 0.0
+
+    dice_scores = (2.0 * intersections[present_classes]) / denominators[present_classes]
+    return dice_scores.mean().item()
+
+
 def get_args_parser():
 
     parser = ArgumentParser("Training script for a PyTorch U-Net model")
@@ -66,6 +102,9 @@ def get_args_parser():
     parser.add_argument("--num-workers", type=int, default=10, help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
+    parser.add_argument("--early-stopping-patience", type=int, default=10, help="Epochs without sufficient validation Dice improvement before stopping")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-3, help="Minimum validation Dice improvement required to reset early stopping")
+    parser.add_argument("--early-stopping-min-epochs", type=int, default=10, help="Minimum number of epochs to run before early stopping can trigger")
 
     return parser
 
@@ -151,7 +190,8 @@ def main(args):
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
     # Training loop
-    best_valid_loss = float('inf')
+    best_valid_mean_dice = float("-inf")
+    epochs_without_improvement = 0
     current_best_model_path = None
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1:04}/{args.epochs:04}")
@@ -181,6 +221,7 @@ def main(args):
         model.eval()
         with torch.no_grad():
             losses = []
+            confusion_matrix = torch.zeros((19, 19), dtype=torch.int64, device=device)
             for i, (images, labels) in enumerate(valid_dataloader):
 
                 labels = convert_to_train_id(labels)  # Convert class IDs to train IDs
@@ -191,10 +232,10 @@ def main(args):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
                 losses.append(loss.item())
+                predictions = outputs.argmax(1)
+                update_confusion_matrix(confusion_matrix, predictions, labels)
             
                 if i == 0:
-                    predictions = outputs.softmax(1).argmax(1)
-
                     predictions = predictions.unsqueeze(1)
                     labels = labels.unsqueeze(1)
 
@@ -213,19 +254,39 @@ def main(args):
                     }, step=(epoch + 1) * len(train_dataloader) - 1)
             
             valid_loss = sum(losses) / len(losses)
-            wandb.log({
-                "valid_loss": valid_loss
-            }, step=(epoch + 1) * len(train_dataloader) - 1)
+            valid_mean_dice = compute_mean_dice(confusion_matrix)
+            improved = valid_mean_dice > best_valid_mean_dice + args.early_stopping_min_delta
 
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
+            if improved:
+                best_valid_mean_dice = valid_mean_dice
+                epochs_without_improvement = 0
                 if current_best_model_path:
                     os.remove(current_best_model_path)
                 current_best_model_path = os.path.join(
                     output_dir, 
-                    f"best_model-epoch={epoch:04}-val_loss={valid_loss:04}.pt"
+                    f"best_model-epoch={epoch:04}-mean_dice={valid_mean_dice:.4f}.pt"
                 )
                 torch.save(model.state_dict(), current_best_model_path)
+            else:
+                epochs_without_improvement += 1
+
+            wandb.log({
+                "valid_loss": valid_loss,
+                "valid_mean_dice": valid_mean_dice,
+                "best_valid_mean_dice": best_valid_mean_dice,
+                "epochs_without_improvement": epochs_without_improvement,
+            }, step=(epoch + 1) * len(train_dataloader) - 1)
+
+            if (
+                epoch + 1 >= args.early_stopping_min_epochs
+                and epochs_without_improvement >= args.early_stopping_patience
+            ):
+                print(
+                    "Early stopping triggered at "
+                    f"epoch {epoch + 1:04}: validation mean Dice did not improve by more than "
+                    f"{args.early_stopping_min_delta:.4f} for {args.early_stopping_patience} epochs."
+                )
+                break
         
     print("Training complete!")
 
