@@ -5,10 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-MODEL_NAME = "segformer-step2-overlap-patch-embedding"
+MODEL_NAME = "segformer-step3-efficient-attention"
 MODEL_DESCRIPTION = (
-    "Step 2: the same single-stage transformer baseline, now with overlapping "
-    "patch embedding while keeping standard self-attention, a plain FFN, and a simple decoder."
+    "Step 3: the single-stage transformer now uses overlap patch embedding and efficient "
+    "self-attention, while still keeping a plain FFN and a simple decoder."
 )
 LAYER_NORM_EPS = 1e-6
 
@@ -17,7 +17,7 @@ MODEL_CONFIG = {
     "decoder_type": "simple",
     "single_stage": {
         "patch_embed_type": "overlap",
-        "attention_type": "standard",
+        "attention_type": "efficient",
         "ffn_type": "plain",
         "embed_dim": 256,
         "depth": 6,
@@ -25,7 +25,7 @@ MODEL_CONFIG = {
         "patch_size": 21,
         "stride": 16,
         "mlp_ratio": 4.0,
-        "sr_ratio": 1,
+        "sr_ratio": 4,
         "drop_path_rate": 0.1,
         "attn_drop": 0.0,
         "proj_drop": 0.0,
