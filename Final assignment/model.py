@@ -5,16 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-MODEL_NAME = "segformer-step5-mit-hierarchy"
+MODEL_NAME = "segformer-step6-segformer-head"
 MODEL_DESCRIPTION = (
-    "Step 5: the model now uses the full hierarchical Mix Vision Transformer encoder, "
-    "while keeping a simple decoder that predicts from the deepest feature map."
+    "Step 6: the model now uses the hierarchical Mix Vision Transformer encoder together "
+    "with the full SegFormer multi-scale fusion head."
 )
 LAYER_NORM_EPS = 1e-6
 
 MODEL_CONFIG = {
     "encoder_type": "hierarchical",
-    "decoder_type": "simple",
+    "decoder_type": "segformer",
     "single_stage": {
         "patch_embed_type": "overlap",
         "attention_type": "efficient",
