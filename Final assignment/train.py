@@ -1,72 +1,59 @@
-import copy
 import os
 import random
 from argparse import ArgumentParser
 from contextlib import nullcontext
 
-import wandb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import wandb
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import Cityscapes
-from torchvision.utils import make_grid
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 from torchvision.transforms import v2
-from torchvision.transforms.v2 import (
-    Compose,
-    Normalize,
-    Resize,
-    ToDtype,
-    ToImage,
-)
+from torchvision.transforms.v2 import Compose, Normalize, Resize, ToDtype, ToImage
 from torchvision.transforms.v2 import functional as F_v2
+from torchvision.utils import make_grid
 
-from model import Model
+from model import MODEL_DESCRIPTION, MODEL_NAME, Model
 
 
 IGNORE_INDEX = 255
 NUM_CLASSES = 19
 CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
 CITYSCAPES_STD = (0.229, 0.224, 0.225)
-DEFAULT_TRAIN_SIZE = (512, 1024)
-
-MODEL_CONFIGS = {
-    "b0": {
-        "embed_dims": (32, 64, 160, 256),
-        "depths": (2, 2, 2, 2),
-        "sr_ratios": (8, 4, 2, 1),
-        "num_heads": (1, 2, 5, 8),
-        "decoder_embedding_dim": 256,
-    },
-    "b5": {
-        "embed_dims": (64, 128, 320, 512),
-        "depths": (3, 6, 40, 3),
-        "sr_ratios": (8, 4, 2, 1),
-        "num_heads": (1, 2, 5, 8),
-        "decoder_embedding_dim": 768,
-    },
-}
+TRAIN_SIZE = (512, 1024)
+MAX_EPOCHS = 50
+BASE_LR = 6e-5
+WEIGHT_DECAY = 1e-2
+WARMUP_ITERS = 1500
+POLY_POWER = 0.9
+MIN_LR_RATIO = 1e-3
+HFLIP_PROB = 0.5
+COLOR_JITTER = 0.4
+GAUSSIAN_BLUR = 0.0
+EMA_DECAY = 0.999
+EARLY_STOP_PATIENCE = 12
+EARLY_STOP_MIN_DELTA = 1e-4
+EVAL_SCALES = (0.75, 1.0, 1.25)
+EVAL_FLIP = True
+DROPOUT = 0.1
 
 
-# Mapping class IDs to train IDs
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
+train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cls.train_id != IGNORE_INDEX}
+train_id_to_color[IGNORE_INDEX] = (0, 0, 0)
 
 
 def convert_to_train_id(label_img: torch.Tensor) -> torch.Tensor:
     return label_img.apply_(lambda x: id_to_trainid[x])
 
 
-# Mapping train IDs to color
-train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cls.train_id != IGNORE_INDEX}
-train_id_to_color[IGNORE_INDEX] = (0, 0, 0)
-
-
 def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
-    batch, _, height, width = prediction.shape
-    color_image = torch.zeros((batch, 3, height, width), dtype=torch.uint8)
+    batch_size, _, height, width = prediction.shape
+    color_image = torch.zeros((batch_size, 3, height, width), dtype=torch.uint8)
 
     for train_id, color in train_id_to_color.items():
         mask = prediction[:, 0] == train_id
@@ -79,6 +66,8 @@ def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def seed_worker(_: int) -> None:
@@ -89,16 +78,6 @@ def seed_worker(_: int) -> None:
 def default_num_workers() -> int:
     cpu_count = os.cpu_count() or 8
     return min(cpu_count, 12)
-
-
-def parse_eval_scales(scales: str) -> tuple[float, ...]:
-    parsed = []
-    for value in str(scales).split(","):
-        scale = float(value.strip())
-        if scale <= 0.0:
-            raise ValueError(f"Evaluation scales must be positive, got {scale}.")
-        parsed.append(scale)
-    return tuple(parsed)
 
 
 def autocast_context(enabled: bool):
@@ -188,39 +167,26 @@ def compute_mean_dice(confusion_matrix: torch.Tensor) -> float:
 
 
 class CityscapesJointTransform:
-    def __init__(
-        self,
-        image_size: tuple[int, int],
-        training: bool,
-        hflip_prob: float,
-        color_jitter: float,
-        gaussian_blur: float,
-    ):
-        self.image_size = image_size
+    def __init__(self, training: bool):
         self.training = training
-        self.hflip_prob = hflip_prob
-        self.gaussian_blur = gaussian_blur
 
         self.eval_image_transform = Compose([
             ToImage(),
-            Resize(image_size, interpolation=InterpolationMode.BILINEAR, antialias=True),
+            Resize(TRAIN_SIZE, interpolation=InterpolationMode.BILINEAR, antialias=True),
             ToDtype(torch.float32, scale=True),
             Normalize(CITYSCAPES_MEAN, CITYSCAPES_STD),
         ])
         self.eval_target_transform = Compose([
             ToImage(),
-            Resize(image_size, interpolation=InterpolationMode.NEAREST),
+            Resize(TRAIN_SIZE, interpolation=InterpolationMode.NEAREST),
             ToDtype(torch.int64),
         ])
-
-        self.color_jitter = None
-        if training and color_jitter > 0.0:
-            self.color_jitter = v2.ColorJitter(
-                brightness=color_jitter,
-                contrast=color_jitter,
-                saturation=color_jitter,
-                hue=min(0.1, color_jitter),
-            )
+        self.color_jitter = v2.ColorJitter(
+            brightness=COLOR_JITTER,
+            contrast=COLOR_JITTER,
+            saturation=COLOR_JITTER,
+            hue=min(0.1, COLOR_JITTER),
+        )
 
     def __call__(self, image, target):
         if not self.training:
@@ -235,7 +201,7 @@ class CityscapesJointTransform:
             j,
             h,
             w,
-            self.image_size,
+            TRAIN_SIZE,
             interpolation=InterpolationMode.BILINEAR,
             antialias=True,
         )
@@ -245,18 +211,17 @@ class CityscapesJointTransform:
             j,
             h,
             w,
-            self.image_size,
+            TRAIN_SIZE,
             interpolation=InterpolationMode.NEAREST,
         )
 
-        if self.hflip_prob > 0.0 and random.random() < self.hflip_prob:
+        if random.random() < HFLIP_PROB:
             image = TF.hflip(image)
             target = TF.hflip(target)
 
         image = ToImage()(image)
-        if self.color_jitter is not None:
-            image = self.color_jitter(image)
-        if self.gaussian_blur > 0.0 and random.random() < self.gaussian_blur:
+        image = self.color_jitter(image)
+        if GAUSSIAN_BLUR > 0.0 and random.random() < GAUSSIAN_BLUR:
             image = F_v2.gaussian_blur(image, kernel_size=3)
 
         image = ToDtype(torch.float32, scale=True)(image)
@@ -270,27 +235,12 @@ class CityscapesSegmentationDataset(Dataset):
         self.dataset = Cityscapes(root, split=split, mode="fine", target_type="semantic")
         self.transform = transform
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int):
         image, target = self.dataset[index]
         return self.transform(image, target)
-
-
-def build_model_from_variant(variant: str, dropout: float) -> Model:
-    try:
-        config = MODEL_CONFIGS[variant]
-    except KeyError as exc:
-        raise ValueError(f"Unknown model variant '{variant}'. Expected one of: {', '.join(MODEL_CONFIGS)}") from exc
-
-    return Model(
-        in_channels=3,
-        n_classes=NUM_CLASSES,
-        dropout=dropout,
-        drop_path_rate=0.1,
-        **config,
-    )
 
 
 def multi_scale_inference(
@@ -332,78 +282,58 @@ def multi_scale_inference(
     return fused_logits / max(num_predictions, 1)
 
 
-def get_args_parser():
-    parser = ArgumentParser("Training script for SegFormer on Cityscapes")
-
+def get_args_parser() -> ArgumentParser:
+    parser = ArgumentParser("Training script for the SegFormer progression experiments")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
     parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=80, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=6e-5, help="Learning rate")
-    parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay")
-    parser.add_argument("--warmup-iters", type=int, default=1500, help="Linear warmup iterations")
-    parser.add_argument("--poly-power", type=float, default=0.9, help="Power for poly learning rate schedule")
-    parser.add_argument("--min-lr-ratio", type=float, default=1e-3, help="Minimum LR as a ratio of base LR")
     parser.add_argument("--num-workers", type=int, default=default_num_workers(), help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--experiment-id", type=str, default=None, help="Experiment ID for Weights & Biases")
-
-    parser.add_argument("--model-variant", type=str, default="b5", choices=tuple(MODEL_CONFIGS), help="SegFormer backbone preset to use")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Decoder dropout rate")
-    parser.add_argument("--train-size", type=int, nargs=2, metavar=("HEIGHT", "WIDTH"), default=DEFAULT_TRAIN_SIZE, help="Training and validation resize/crop size")
-    parser.add_argument("--hflip-prob", type=float, default=0.5, help="Horizontal flip probability for training augmentation")
-    parser.add_argument("--color-jitter", type=float, default=0.4, help="Color jitter strength")
-    parser.add_argument("--gaussian-blur", type=float, default=0.0, help="Probability of Gaussian blur")
-
-    parser.add_argument("--ema-decay", type=float, default=0.999, help="EMA decay for evaluation model; set <= 0 to disable")
-    parser.add_argument("--early-stop-patience", type=int, default=12, help="Epochs without improvement before stopping")
-    parser.add_argument("--early-stop-min-delta", type=float, default=1e-4, help="Minimum Dice improvement to reset early stopping")
-
-    parser.add_argument("--eval-scales", type=str, default="0.75,1.0,1.25", help="Comma-separated multi-scale validation factors")
-    parser.add_argument("--eval-flip", dest="eval_flip", action="store_true", help="Enable horizontal flip during validation TTA")
-    parser.add_argument("--no-eval-flip", dest="eval_flip", action="store_false", help="Disable horizontal flip during validation TTA")
-    parser.set_defaults(eval_flip=True)
-
-    parser.add_argument("--amp", dest="amp", action="store_true", help="Enable CUDA AMP")
+    parser.add_argument("--experiment-id", type=str, default=None, help="Optional W&B run name override")
     parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA AMP")
     parser.set_defaults(amp=True)
-
     return parser
 
 
-def main(args):
-    experiment_id = args.experiment_id or f"segformer-{args.model_variant}"
+def main(args) -> None:
+    experiment_id = args.experiment_id or MODEL_NAME
     output_dir = os.path.join("checkpoints", experiment_id)
     os.makedirs(output_dir, exist_ok=True)
 
     seed_everything(args.seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = not torch.backends.cudnn.deterministic
+    torch.backends.cudnn.benchmark = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = args.amp and torch.cuda.is_available()
-    eval_scales = parse_eval_scales(args.eval_scales)
 
     wandb.init(
         project="5lsm0-cityscapes-segmentation",
         name=experiment_id,
-        config=vars(args),
+        config={
+            "model_name": MODEL_NAME,
+            "model_description": MODEL_DESCRIPTION,
+            "train_size": TRAIN_SIZE,
+            "max_epochs": MAX_EPOCHS,
+            "base_lr": BASE_LR,
+            "weight_decay": WEIGHT_DECAY,
+            "warmup_iters": WARMUP_ITERS,
+            "poly_power": POLY_POWER,
+            "min_lr_ratio": MIN_LR_RATIO,
+            "ema_decay": EMA_DECAY,
+            "early_stop_patience": EARLY_STOP_PATIENCE,
+            "early_stop_min_delta": EARLY_STOP_MIN_DELTA,
+            "eval_scales": EVAL_SCALES,
+            "eval_flip": EVAL_FLIP,
+            "dropout": DROPOUT,
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "seed": args.seed,
+            "amp": amp_enabled,
+        },
     )
 
-    train_transform = CityscapesJointTransform(
-        image_size=tuple(args.train_size),
-        training=True,
-        hflip_prob=args.hflip_prob,
-        color_jitter=args.color_jitter,
-        gaussian_blur=args.gaussian_blur,
-    )
-    valid_transform = CityscapesJointTransform(
-        image_size=tuple(args.train_size),
-        training=False,
-        hflip_prob=0.0,
-        color_jitter=0.0,
-        gaussian_blur=0.0,
-    )
-
+    train_transform = CityscapesJointTransform(training=True)
+    valid_transform = CityscapesJointTransform(training=False)
     train_dataset = CityscapesSegmentationDataset(args.data_dir, split="train", transform=train_transform)
     valid_dataset = CityscapesSegmentationDataset(args.data_dir, split="val", transform=valid_transform)
 
@@ -428,24 +358,15 @@ def main(args):
         worker_init_fn=seed_worker,
     )
 
-    model = build_model_from_variant(args.model_variant, args.dropout).to(device)
-
-    pretrained_path = f"./mit-{args.model_variant}"
-    try:
-        model.load_pretrained(pretrained_path)
-    except Exception as exc:
-        print(f"Warning: Could not load pretrained weights from {pretrained_path}. {exc}")
-        print("Training from scratch...")
-
-    ema_model = None
-    if args.ema_decay > 0.0:
-        ema_model = copy.deepcopy(model).to(device)
-        ema_model.eval()
-        for parameter in ema_model.parameters():
-            parameter.requires_grad = False
+    model = Model(in_channels=3, n_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+    ema_model = Model(in_channels=3, n_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+    ema_model.load_state_dict(model.state_dict())
+    ema_model.eval()
+    for parameter in ema_model.parameters():
+        parameter.requires_grad = False
 
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = AdamW(model.parameters(), lr=BASE_LR, weight_decay=WEIGHT_DECAY)
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     best_valid_loss = float("inf")
@@ -454,25 +375,28 @@ def main(args):
     current_best_model_path = None
     epochs_without_improvement = 0
     global_step = 0
-    total_iters = args.epochs * max(len(train_dataloader), 1)
+    total_iters = MAX_EPOCHS * max(len(train_dataloader), 1)
 
-    for epoch in range(args.epochs):
-        print(f"Epoch {epoch + 1:04}/{args.epochs:04}")
+    print(f"Training {MODEL_NAME}")
+    print(MODEL_DESCRIPTION)
+
+    for epoch in range(MAX_EPOCHS):
+        print(f"Epoch {epoch + 1:04}/{MAX_EPOCHS:04}")
 
         model.train()
         train_losses = []
-        for i, (images, labels) in enumerate(train_dataloader):
+        for images, labels in train_dataloader:
             labels = convert_to_train_id(labels)
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True).long().squeeze(1)
 
             current_lr = poly_lr(
-                base_lr=args.lr,
+                base_lr=BASE_LR,
                 current_iter=global_step,
                 max_iter=total_iters,
-                warmup_iters=args.warmup_iters,
-                power=args.poly_power,
-                min_lr_ratio=args.min_lr_ratio,
+                warmup_iters=WARMUP_ITERS,
+                power=POLY_POWER,
+                min_lr_ratio=MIN_LR_RATIO,
             )
             for param_group in optimizer.param_groups:
                 param_group["lr"] = current_lr
@@ -491,9 +415,7 @@ def main(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
-
-            if ema_model is not None:
-                update_ema_model(ema_model, model, args.ema_decay)
+            update_ema_model(ema_model, model, EMA_DECAY)
 
             train_losses.append(loss.item())
             wandb.log(
@@ -506,15 +428,14 @@ def main(args):
             )
             global_step += 1
 
-        model.eval()
-        eval_model = ema_model if ema_model is not None else model
+        eval_model = ema_model
         eval_model.eval()
 
         with torch.no_grad():
             valid_losses = []
             confusion_matrix = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.int64, device=device)
 
-            for i, (images, labels) in enumerate(valid_dataloader):
+            for batch_index, (images, labels) in enumerate(valid_dataloader):
                 labels = convert_to_train_id(labels)
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True).long().squeeze(1)
@@ -522,15 +443,15 @@ def main(args):
                 outputs = multi_scale_inference(
                     eval_model,
                     images,
-                    scales=eval_scales,
-                    flip=args.eval_flip,
+                    scales=EVAL_SCALES,
+                    flip=EVAL_FLIP,
                     amp_enabled=amp_enabled,
                 )
                 loss = criterion(outputs, labels)
                 valid_losses.append(loss.item())
                 update_confusion_matrix(confusion_matrix, outputs, labels, num_classes=NUM_CLASSES)
 
-                if i == 0:
+                if batch_index == 0:
                     predictions = outputs.softmax(1).argmax(1, keepdim=True)
                     labels_vis = labels.unsqueeze(1)
 
@@ -552,19 +473,8 @@ def main(args):
             valid_loss = sum(valid_losses) / max(len(valid_losses), 1)
             valid_miou = compute_mean_iou(confusion_matrix)
             valid_mean_dice = compute_mean_dice(confusion_matrix)
+            improved = valid_mean_dice > best_dice + EARLY_STOP_MIN_DELTA
 
-            wandb.log(
-                {
-                    "epoch": epoch + 1,
-                    "epoch_train_loss": train_loss,
-                    "valid_loss": valid_loss,
-                    "valid_miou": valid_miou,
-                    "valid_mean_dice": valid_mean_dice,
-                },
-                step=max(global_step - 1, 0),
-            )
-
-            improved = valid_mean_dice > best_dice + args.early_stop_min_delta
             if improved:
                 best_dice = valid_mean_dice
                 best_miou = valid_miou
@@ -578,16 +488,29 @@ def main(args):
                     output_dir,
                     f"best_model-epoch={epoch:04}-dice={valid_mean_dice:.4f}-miou={valid_miou:.4f}-val_loss={valid_loss:.4f}.pt",
                 )
-                checkpoint_source = ema_model if ema_model is not None else model
-                torch.save(checkpoint_source.state_dict(), current_best_model_path)
+                torch.save(ema_model.state_dict(), current_best_model_path)
             else:
                 epochs_without_improvement += 1
-                if epochs_without_improvement >= args.early_stop_patience:
-                    print(
-                        f"Early stopping at epoch {epoch + 1}: "
-                        f"no Dice improvement for {args.early_stop_patience} epochs."
-                    )
-                    break
+
+            wandb.log(
+                {
+                    "epoch": epoch + 1,
+                    "epoch_train_loss": train_loss,
+                    "valid_loss": valid_loss,
+                    "valid_miou": valid_miou,
+                    "valid_mean_dice": valid_mean_dice,
+                    "best_valid_mean_dice": best_dice,
+                    "epochs_without_improvement": epochs_without_improvement,
+                },
+                step=max(global_step - 1, 0),
+            )
+
+            if epochs_without_improvement >= EARLY_STOP_PATIENCE:
+                print(
+                    f"Early stopping at epoch {epoch + 1}: "
+                    f"no mean Dice improvement for {EARLY_STOP_PATIENCE} epochs."
+                )
+                break
 
     print("Training complete!")
 
@@ -595,8 +518,7 @@ def main(args):
         output_dir,
         f"final_model-epoch={epoch:04}-dice={best_dice:.4f}-miou={best_miou:.4f}-val_loss={best_valid_loss:.4f}.pt",
     )
-    checkpoint_source = ema_model if ema_model is not None else model
-    torch.save(checkpoint_source.state_dict(), final_model_path)
+    torch.save(ema_model.state_dict(), final_model_path)
     wandb.finish()
 
 
