@@ -5,15 +5,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-MODEL_NAME = "segformer-step4-mix-ffn"
+MODEL_NAME = "segformer-step5-mit-hierarchy"
 MODEL_DESCRIPTION = (
-    "Step 4: the single-stage transformer now combines overlap patch embedding, efficient "
-    "self-attention, and Mix-FFN, while still using a simple decoder."
+    "Step 5: the model now uses the full hierarchical Mix Vision Transformer encoder, "
+    "while keeping a simple decoder that predicts from the deepest feature map."
 )
 LAYER_NORM_EPS = 1e-6
 
 MODEL_CONFIG = {
-    "encoder_type": "single_stage",
+    "encoder_type": "hierarchical",
     "decoder_type": "simple",
     "single_stage": {
         "patch_embed_type": "overlap",
