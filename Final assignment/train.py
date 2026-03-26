@@ -28,6 +28,7 @@ BASE_IMAGE_SIZE = (1024, 2048)
 TRAIN_CROP_SIZE = (1024, 1024)
 TRAIN_RATIO_RANGE = (0.5, 2.0)
 TRAIN_CAT_MAX_RATIO = 0.75
+DEFAULT_BATCH_SIZE = 1
 MAX_EPOCHS = 50
 BASE_LR = 6e-5
 WEIGHT_DECAY = 1e-2
@@ -330,7 +331,7 @@ def multi_scale_inference(
 def get_args_parser() -> ArgumentParser:
     parser = ArgumentParser("Training script for the SegFormer progression experiments")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
-    parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Training batch size")
     parser.add_argument("--num-workers", type=int, default=default_num_workers(), help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default=None, help="Optional W&B run name override")
@@ -344,6 +345,12 @@ def main(args) -> None:
     experiment_id = args.experiment_id or f"{MODEL_NAME}-{args.model_variant}"
     output_dir = os.path.join("checkpoints", experiment_id)
     os.makedirs(output_dir, exist_ok=True)
+
+    if args.model_variant == "b5" and TRAIN_CROP_SIZE == (1024, 1024) and args.batch_size > 1:
+        print(
+            "Warning: SegFormer-B5 with 1024x1024 crops usually requires batch_size=1 on a 40GB GPU. "
+            "If you hit CUDA OOM, rerun with --batch-size 1."
+        )
 
     seed_everything(args.seed)
     torch.backends.cudnn.deterministic = True
