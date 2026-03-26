@@ -46,12 +46,13 @@ DROPOUT = 0.1
 
 
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
+id_to_trainid[IGNORE_INDEX] = IGNORE_INDEX
 train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cls.train_id != IGNORE_INDEX}
 train_id_to_color[IGNORE_INDEX] = (0, 0, 0)
 
 
 def convert_to_train_id(label_img: torch.Tensor) -> torch.Tensor:
-    return label_img.apply_(lambda x: id_to_trainid[x])
+    return label_img.apply_(lambda x: id_to_trainid.get(int(x), IGNORE_INDEX))
 
 
 def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
