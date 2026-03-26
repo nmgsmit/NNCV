@@ -8,4 +8,4 @@
 
 srun apptainer exec --nv --env-file .env container.sif /bin/bash main.sh \
   --model-variant b5 \
-  --experiment-id segformer-step7-1-head-lr-lovasz-b5
+  --experiment-id segformer-step7-2-msfe-fpn-syncbn-lovasz-b5
