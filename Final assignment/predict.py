@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms.v2 import Compose, InterpolationMode, Normalize, Resize, ToDtype, ToImage
 
-from model import Model
+from model import Model, infer_model_variant_from_state_dict
 
 
 IMAGE_DIR = "/data"
@@ -39,8 +39,11 @@ def postprocess(pred: torch.Tensor, original_shape: tuple[int, int]) -> np.ndarr
 def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = Model()
     state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+    model_variant = infer_model_variant_from_state_dict(state_dict)
+    print(f"Loaded SegFormer checkpoint as variant '{model_variant}'.")
+
+    model = Model(variant=model_variant)
     model.load_state_dict(state_dict, strict=True)
     model.eval().to(device)
 

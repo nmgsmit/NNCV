@@ -1,49 +1,65 @@
 import math
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-MODEL_NAME = "segformer-step6-segformer-head"
+MODEL_NAME = "segformer-pretrained-b0-b5"
 MODEL_DESCRIPTION = (
-    "Step 6: the model now uses the hierarchical Mix Vision Transformer encoder together "
-    "with the full SegFormer multi-scale fusion head."
+    "Full SegFormer branch with pretrained MiT encoder loading and support for "
+    "both the b0 and b5 variants."
 )
 LAYER_NORM_EPS = 1e-6
 
-MODEL_CONFIG = {
-    "encoder_type": "hierarchical",
-    "decoder_type": "segformer",
-    "single_stage": {
-        "patch_embed_type": "overlap",
-        "attention_type": "efficient",
-        "ffn_type": "mix",
-        "embed_dim": 256,
-        "depth": 6,
-        "num_heads": 8,
-        "patch_size": 21,
-        "stride": 16,
-        "mlp_ratio": 4.0,
-        "sr_ratio": 4,
-        "drop_path_rate": 0.1,
-        "attn_drop": 0.0,
-        "proj_drop": 0.0,
-        "ffn_drop": 0.0,
-    },
-    "hierarchical": {
+MODEL_VARIANTS = {
+    "b0": {
         "embed_dims": (32, 64, 160, 256),
         "depths": (2, 2, 2, 2),
-        "num_heads": (1, 2, 5, 8),
         "sr_ratios": (8, 4, 2, 1),
+        "num_heads": (1, 2, 5, 8),
         "mlp_ratios": (4.0, 4.0, 4.0, 4.0),
         "decoder_embedding_dim": 256,
         "drop_path_rate": 0.1,
-        "attn_drop": 0.0,
-        "proj_drop": 0.0,
-        "ffn_drop": 0.0,
+    },
+    "b5": {
+        "embed_dims": (64, 128, 320, 512),
+        "depths": (3, 6, 40, 3),
+        "sr_ratios": (8, 4, 2, 1),
+        "num_heads": (1, 2, 5, 8),
+        "mlp_ratios": (4.0, 4.0, 4.0, 4.0),
+        "decoder_embedding_dim": 768,
+        "drop_path_rate": 0.1,
     },
 }
+
+
+def get_model_variant_config(variant: str) -> dict:
+    try:
+        return MODEL_VARIANTS[variant]
+    except KeyError as exc:
+        available = ", ".join(MODEL_VARIANTS)
+        raise ValueError(f"Unknown SegFormer variant '{variant}'. Available variants: {available}.") from exc
+
+
+def infer_model_variant_from_state_dict(state_dict: dict[str, torch.Tensor]) -> str:
+    stage1_weight = state_dict.get("encoder.stage1.patch_embed.proj.weight")
+    decoder_proj = state_dict.get("decode_head.linear_c1.proj.weight")
+
+    if torch.is_tensor(stage1_weight):
+        stage1_dim = int(stage1_weight.shape[0])
+        for variant, config in MODEL_VARIANTS.items():
+            if config["embed_dims"][0] == stage1_dim:
+                return variant
+
+    if torch.is_tensor(decoder_proj):
+        decoder_dim = int(decoder_proj.shape[0])
+        for variant, config in MODEL_VARIANTS.items():
+            if config["decoder_embedding_dim"] == decoder_dim:
+                return variant
+
+    raise KeyError("Unable to infer the SegFormer variant from the checkpoint state dict.")
 
 
 class DropPath(nn.Module):
@@ -60,26 +76,6 @@ class DropPath(nn.Module):
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
         random_tensor.floor_()
         return x.div(keep_prob) * random_tensor
-
-
-class PlainPatchEmbed(nn.Module):
-    def __init__(self, in_channels: int, embed_dim: int, patch_size: int, stride: int):
-        super().__init__()
-        self.proj = nn.Conv2d(
-            in_channels,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=stride,
-            padding=0,
-        )
-        self.norm = nn.LayerNorm(embed_dim, eps=LAYER_NORM_EPS)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
-        x = self.proj(x)
-        _, _, height, width = x.shape
-        x = x.flatten(2).transpose(1, 2)
-        x = self.norm(x)
-        return x, height, width
 
 
 class OverlapPatchEmbed(nn.Module):
@@ -100,50 +96,6 @@ class OverlapPatchEmbed(nn.Module):
         x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x, height, width
-
-
-class StandardSelfAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 1,
-        qkv_bias: bool = True,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-    ):
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
-
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        del height, width
-
-        batch_size, num_tokens, channels = x.shape
-        q = self.q(x).reshape(batch_size, num_tokens, self.num_heads, channels // self.num_heads)
-        q = q.permute(0, 2, 1, 3)
-
-        kv = self.kv(x).reshape(batch_size, num_tokens, 2, self.num_heads, channels // self.num_heads)
-        kv = kv.permute(2, 0, 3, 1, 4)
-        key, value = kv[0], kv[1]
-
-        attention = (q @ key.transpose(-2, -1)) * self.scale
-        attention = attention.softmax(dim=-1)
-        attention = self.attn_drop(attention)
-
-        x = (attention @ value).transpose(1, 2).reshape(batch_size, num_tokens, channels)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
 
 
 class EfficientSelfAttention(nn.Module):
@@ -204,25 +156,6 @@ class EfficientSelfAttention(nn.Module):
         return x
 
 
-class PlainFFN(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, drop: float = 0.0):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, dim)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        del height, width
-
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-
 class MixFFN(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, drop: float = 0.0):
         super().__init__()
@@ -258,107 +191,31 @@ class TransformerBlock(nn.Module):
         dim: int,
         num_heads: int,
         mlp_ratio: float = 4.0,
-        attention_type: str = "standard",
-        ffn_type: str = "plain",
         sr_ratio: int = 1,
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        ffn_drop: float = 0.0,
+        mlp_drop: float = 0.0,
         drop_path: float = 0.0,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, eps=LAYER_NORM_EPS)
-
-        if attention_type == "standard":
-            self.attn = StandardSelfAttention(
-                dim,
-                num_heads=num_heads,
-                qkv_bias=qkv_bias,
-                attn_drop=attn_drop,
-                proj_drop=proj_drop,
-            )
-        elif attention_type == "efficient":
-            self.attn = EfficientSelfAttention(
-                dim,
-                num_heads=num_heads,
-                sr_ratio=sr_ratio,
-                qkv_bias=qkv_bias,
-                attn_drop=attn_drop,
-                proj_drop=proj_drop,
-            )
-        else:
-            raise ValueError(f"Unsupported attention type: {attention_type}")
-
+        self.attn = EfficientSelfAttention(
+            dim,
+            num_heads=num_heads,
+            sr_ratio=sr_ratio,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
         self.drop_path = DropPath(drop_path)
         self.norm2 = nn.LayerNorm(dim, eps=LAYER_NORM_EPS)
-
-        if ffn_type == "plain":
-            self.ffn = PlainFFN(dim, int(dim * mlp_ratio), drop=ffn_drop)
-        elif ffn_type == "mix":
-            self.ffn = MixFFN(dim, int(dim * mlp_ratio), drop=ffn_drop)
-        else:
-            raise ValueError(f"Unsupported FFN type: {ffn_type}")
+        self.mlp = MixFFN(dim, int(dim * mlp_ratio), drop=mlp_drop)
 
     def forward(self, x: torch.Tensor, height: int, width: int) -> torch.Tensor:
         x = x + self.drop_path(self.attn(self.norm1(x), height, width))
-        x = x + self.drop_path(self.ffn(self.norm2(x), height, width))
+        x = x + self.drop_path(self.mlp(self.norm2(x), height, width))
         return x
-
-
-class SingleStageTransformerEncoder(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        embed_dim: int,
-        depth: int,
-        num_heads: int,
-        patch_size: int,
-        stride: int,
-        attention_type: str,
-        ffn_type: str,
-        patch_embed_type: str,
-        mlp_ratio: float,
-        sr_ratio: int,
-        qkv_bias: bool = True,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-        ffn_drop: float = 0.0,
-        drop_path_rate: float = 0.0,
-    ):
-        super().__init__()
-        patch_cls = PlainPatchEmbed if patch_embed_type == "plain" else OverlapPatchEmbed
-        self.patch_embed = patch_cls(in_channels, embed_dim, patch_size, stride)
-
-        drop_path_rates = torch.linspace(0, drop_path_rate, depth).tolist()
-        self.blocks = nn.ModuleList(
-            [
-                TransformerBlock(
-                    dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    attention_type=attention_type,
-                    ffn_type=ffn_type,
-                    sr_ratio=sr_ratio,
-                    qkv_bias=qkv_bias,
-                    attn_drop=attn_drop,
-                    proj_drop=proj_drop,
-                    ffn_drop=ffn_drop,
-                    drop_path=drop_path_rates[index],
-                )
-                for index in range(depth)
-            ]
-        )
-        self.norm = nn.LayerNorm(embed_dim, eps=LAYER_NORM_EPS)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor]:
-        x, height, width = self.patch_embed(x)
-        for block in self.blocks:
-            x = block(x, height, width)
-        x = self.norm(x)
-        batch_size, _, channels = x.shape
-        x = x.transpose(1, 2).reshape(batch_size, channels, height, width)
-        return (x,)
 
 
 class MixVisionStage(nn.Module):
@@ -376,7 +233,7 @@ class MixVisionStage(nn.Module):
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        ffn_drop: float = 0.0,
+        mlp_drop: float = 0.0,
     ):
         super().__init__()
         self.patch_embed = OverlapPatchEmbed(in_channels, embed_dim, patch_size, stride)
@@ -386,13 +243,11 @@ class MixVisionStage(nn.Module):
                     dim=embed_dim,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
-                    attention_type="efficient",
-                    ffn_type="mix",
                     sr_ratio=sr_ratio,
                     qkv_bias=qkv_bias,
                     attn_drop=attn_drop,
                     proj_drop=proj_drop,
-                    ffn_drop=ffn_drop,
+                    mlp_drop=mlp_drop,
                     drop_path=drop_path_rates[index],
                 )
                 for index in range(depth)
@@ -418,11 +273,11 @@ class MixVisionTransformerEncoder(nn.Module):
         num_heads: tuple[int, int, int, int],
         sr_ratios: tuple[int, int, int, int],
         mlp_ratios: tuple[float, float, float, float],
-        drop_path_rate: float = 0.1,
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        ffn_drop: float = 0.0,
+        mlp_drop: float = 0.0,
+        drop_path_rate: float = 0.1,
     ):
         super().__init__()
 
@@ -442,13 +297,13 @@ class MixVisionTransformerEncoder(nn.Module):
             num_heads=num_heads[0],
             sr_ratio=sr_ratios[0],
             mlp_ratio=mlp_ratios[0],
+            qkv_bias=qkv_bias,
             patch_size=7,
             stride=4,
             drop_path_rates=stage_slices[0],
-            qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
-            ffn_drop=ffn_drop,
+            mlp_drop=mlp_drop,
         )
         self.stage2 = MixVisionStage(
             in_channels=embed_dims[0],
@@ -457,13 +312,13 @@ class MixVisionTransformerEncoder(nn.Module):
             num_heads=num_heads[1],
             sr_ratio=sr_ratios[1],
             mlp_ratio=mlp_ratios[1],
+            qkv_bias=qkv_bias,
             patch_size=3,
             stride=2,
             drop_path_rates=stage_slices[1],
-            qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
-            ffn_drop=ffn_drop,
+            mlp_drop=mlp_drop,
         )
         self.stage3 = MixVisionStage(
             in_channels=embed_dims[1],
@@ -472,13 +327,13 @@ class MixVisionTransformerEncoder(nn.Module):
             num_heads=num_heads[2],
             sr_ratio=sr_ratios[2],
             mlp_ratio=mlp_ratios[2],
+            qkv_bias=qkv_bias,
             patch_size=3,
             stride=2,
             drop_path_rates=stage_slices[2],
-            qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
-            ffn_drop=ffn_drop,
+            mlp_drop=mlp_drop,
         )
         self.stage4 = MixVisionStage(
             in_channels=embed_dims[2],
@@ -487,13 +342,13 @@ class MixVisionTransformerEncoder(nn.Module):
             num_heads=num_heads[3],
             sr_ratio=sr_ratios[3],
             mlp_ratio=mlp_ratios[3],
+            qkv_bias=qkv_bias,
             patch_size=3,
             stride=2,
             drop_path_rates=stage_slices[3],
-            qkv_bias=qkv_bias,
             attn_drop=attn_drop,
             proj_drop=proj_drop,
-            ffn_drop=ffn_drop,
+            mlp_drop=mlp_drop,
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -502,15 +357,6 @@ class MixVisionTransformerEncoder(nn.Module):
         c3 = self.stage3(c2)
         c4 = self.stage4(c3)
         return c1, c2, c3, c4
-
-
-class SimpleDecoderHead(nn.Module):
-    def __init__(self, in_channels: int, n_classes: int):
-        super().__init__()
-        self.classifier = nn.Conv2d(in_channels, n_classes, kernel_size=1)
-
-    def forward(self, features: tuple[torch.Tensor, ...]) -> torch.Tensor:
-        return self.classifier(features[-1])
 
 
 class SegFormerMLP(nn.Module):
@@ -567,64 +413,41 @@ class SegFormerHead(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, in_channels: int = 3, n_classes: int = 19, dropout: float = 0.1):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        n_classes: int = 19,
+        variant: str = "b5",
+        dropout: float = 0.1,
+        attn_drop: float = 0.0,
+        mlp_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
         super().__init__()
 
         self.in_channels = in_channels
+        self.variant = variant
+        self.config = get_model_variant_config(variant)
 
-        if MODEL_CONFIG["encoder_type"] == "single_stage":
-            config = MODEL_CONFIG["single_stage"]
-            self.encoder = SingleStageTransformerEncoder(
-                in_channels=in_channels,
-                embed_dim=config["embed_dim"],
-                depth=config["depth"],
-                num_heads=config["num_heads"],
-                patch_size=config["patch_size"],
-                stride=config["stride"],
-                attention_type=config["attention_type"],
-                ffn_type=config["ffn_type"],
-                patch_embed_type=config["patch_embed_type"],
-                mlp_ratio=config["mlp_ratio"],
-                sr_ratio=config["sr_ratio"],
-                qkv_bias=True,
-                attn_drop=config["attn_drop"],
-                proj_drop=config["proj_drop"],
-                ffn_drop=config["ffn_drop"],
-                drop_path_rate=config["drop_path_rate"],
-            )
-            head_in_channels = config["embed_dim"]
-        elif MODEL_CONFIG["encoder_type"] == "hierarchical":
-            config = MODEL_CONFIG["hierarchical"]
-            self.encoder = MixVisionTransformerEncoder(
-                in_channels=in_channels,
-                embed_dims=config["embed_dims"],
-                depths=config["depths"],
-                num_heads=config["num_heads"],
-                sr_ratios=config["sr_ratios"],
-                mlp_ratios=config["mlp_ratios"],
-                drop_path_rate=config["drop_path_rate"],
-                qkv_bias=True,
-                attn_drop=config["attn_drop"],
-                proj_drop=config["proj_drop"],
-                ffn_drop=config["ffn_drop"],
-            )
-            head_in_channels = config["embed_dims"][-1]
-        else:
-            raise ValueError(f"Unsupported encoder type: {MODEL_CONFIG['encoder_type']}")
-
-        if MODEL_CONFIG["decoder_type"] == "simple":
-            self.decode_head = SimpleDecoderHead(head_in_channels, n_classes)
-        elif MODEL_CONFIG["decoder_type"] == "segformer":
-            config = MODEL_CONFIG["hierarchical"]
-            self.decode_head = SegFormerHead(
-                in_channels=config["embed_dims"],
-                embedding_dim=config["decoder_embedding_dim"],
-                n_classes=n_classes,
-                dropout=dropout,
-            )
-        else:
-            raise ValueError(f"Unsupported decoder type: {MODEL_CONFIG['decoder_type']}")
-
+        self.encoder = MixVisionTransformerEncoder(
+            in_channels=in_channels,
+            embed_dims=self.config["embed_dims"],
+            depths=self.config["depths"],
+            num_heads=self.config["num_heads"],
+            sr_ratios=self.config["sr_ratios"],
+            mlp_ratios=self.config["mlp_ratios"],
+            qkv_bias=True,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            mlp_drop=mlp_drop,
+            drop_path_rate=self.config["drop_path_rate"],
+        )
+        self.decode_head = SegFormerHead(
+            in_channels=self.config["embed_dims"],
+            embedding_dim=self.config["decoder_embedding_dim"],
+            n_classes=n_classes,
+            dropout=dropout,
+        )
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -641,6 +464,121 @@ class Model(nn.Module):
             module.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
             if module.bias is not None:
                 module.bias.data.zero_()
+
+    def _extract_checkpoint_state(self, checkpoint: dict) -> dict:
+        if not isinstance(checkpoint, dict):
+            raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)}")
+
+        for nested_key in ("state_dict", "model", "module"):
+            nested_state = checkpoint.get(nested_key)
+            if isinstance(nested_state, dict):
+                return nested_state
+        return checkpoint
+
+    def _remap_pretrained_key(self, key: str) -> str | None:
+        if key.startswith("module."):
+            key = key[len("module."):]
+
+        valid_prefixes = (
+            "segformer.encoder.",
+            "encoder.",
+            "backbone.",
+            "segformer.backbone.",
+        )
+
+        source_prefix = next((prefix for prefix in valid_prefixes if key.startswith(prefix)), None)
+        if source_prefix is None:
+            return None
+
+        key = f"encoder.{key[len(source_prefix):]}"
+
+        for stage_idx in range(4):
+            key = key.replace(f"patch_embeddings.{stage_idx}.proj", f"stage{stage_idx + 1}.patch_embed.proj")
+            key = key.replace(
+                f"patch_embeddings.{stage_idx}.layer_norm",
+                f"stage{stage_idx + 1}.patch_embed.norm",
+            )
+            key = key.replace(f"layer_norm.{stage_idx}", f"stage{stage_idx + 1}.norm")
+            key = key.replace(f"block.{stage_idx}", f"stage{stage_idx + 1}.blocks")
+
+        key = key.replace(".layer_norm_1", ".norm1")
+        key = key.replace(".layer_norm_2", ".norm2")
+        key = key.replace(".attention.self.query", ".attn.q")
+        key = key.replace(".attention.self.sr", ".attn.sr")
+        key = key.replace(".attention.self.layer_norm", ".attn.norm")
+        key = key.replace(".attention.output.dense", ".attn.proj")
+        key = key.replace(".mlp.dense1", ".mlp.fc1")
+        key = key.replace(".mlp.dwconv.dwconv", ".mlp.dwconv")
+        key = key.replace(".mlp.dense2", ".mlp.fc2")
+        return key
+
+    def load_pretrained(self, folder_path: str) -> None:
+        weight_path = os.path.join(folder_path, "pytorch_model.bin")
+        if not os.path.exists(weight_path):
+            raise FileNotFoundError(f"Missing pretrained weights at {weight_path}")
+
+        checkpoint = torch.load(weight_path, map_location="cpu")
+        checkpoint_state = self._extract_checkpoint_state(checkpoint)
+        current_state = self.state_dict()
+        remapped_state: dict[str, torch.Tensor] = {}
+        kv_buffers: dict[str, dict[str, torch.Tensor]] = {}
+
+        for source_key, value in checkpoint_state.items():
+            target_key = self._remap_pretrained_key(source_key)
+            if target_key is None:
+                continue
+
+            if source_key.endswith(".attention.self.key.weight"):
+                fused_key = target_key.replace(".attn.q.weight", ".attn.kv.weight").replace(
+                    ".attention.self.key.weight",
+                    ".attn.kv.weight",
+                )
+                kv_buffers.setdefault(fused_key, {})["key"] = value
+                continue
+            if source_key.endswith(".attention.self.value.weight"):
+                fused_key = target_key.replace(".attention.self.value.weight", ".attn.kv.weight")
+                kv_buffers.setdefault(fused_key, {})["value"] = value
+                continue
+            if source_key.endswith(".attention.self.key.bias"):
+                fused_key = target_key.replace(".attn.q.bias", ".attn.kv.bias").replace(
+                    ".attention.self.key.bias",
+                    ".attn.kv.bias",
+                )
+                kv_buffers.setdefault(fused_key, {})["key"] = value
+                continue
+            if source_key.endswith(".attention.self.value.bias"):
+                fused_key = target_key.replace(".attention.self.value.bias", ".attn.kv.bias")
+                kv_buffers.setdefault(fused_key, {})["value"] = value
+                continue
+
+            if target_key in current_state and current_state[target_key].shape == value.shape:
+                remapped_state[target_key] = value
+
+        for fused_key, pieces in kv_buffers.items():
+            if "key" not in pieces or "value" not in pieces:
+                continue
+            fused_value = torch.cat([pieces["key"], pieces["value"]], dim=0)
+            if fused_key in current_state and current_state[fused_key].shape == fused_value.shape:
+                remapped_state[fused_key] = fused_value
+
+        missing_encoder_keys = sorted(
+            key for key in current_state.keys()
+            if key.startswith("encoder.") and key not in remapped_state
+        )
+
+        msg = self.load_state_dict(remapped_state, strict=False)
+        print(f"Loaded {len(remapped_state)} pretrained tensors from {weight_path}")
+        print(f"Pretrained encoder load result: {msg}")
+        if missing_encoder_keys:
+            preview_count = min(10, len(missing_encoder_keys))
+            print(
+                f"Encoder keys still randomly initialized: {len(missing_encoder_keys)} "
+                f"(showing first {preview_count})"
+            )
+            for key in missing_encoder_keys[:preview_count]:
+                print(f"  - {key}")
+            if len(missing_encoder_keys) > preview_count:
+                print("  - ...")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[1] != self.in_channels:

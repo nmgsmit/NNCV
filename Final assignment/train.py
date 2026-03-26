@@ -17,7 +17,7 @@ from torchvision.transforms.v2 import Compose, Normalize, Resize, ToDtype, ToIma
 from torchvision.transforms.v2 import functional as F_v2
 from torchvision.utils import make_grid
 
-from model import MODEL_DESCRIPTION, MODEL_NAME, Model
+from model import MODEL_DESCRIPTION, MODEL_NAME, MODEL_VARIANTS, Model
 
 
 IGNORE_INDEX = 255
@@ -289,13 +289,14 @@ def get_args_parser() -> ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=default_num_workers(), help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default=None, help="Optional W&B run name override")
+    parser.add_argument("--model-variant", type=str, default="b5", choices=tuple(MODEL_VARIANTS), help="Pretrained SegFormer backbone variant")
     parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable CUDA AMP")
     parser.set_defaults(amp=True)
     return parser
 
 
 def main(args) -> None:
-    experiment_id = args.experiment_id or MODEL_NAME
+    experiment_id = args.experiment_id or f"{MODEL_NAME}-{args.model_variant}"
     output_dir = os.path.join("checkpoints", experiment_id)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -312,6 +313,7 @@ def main(args) -> None:
         config={
             "model_name": MODEL_NAME,
             "model_description": MODEL_DESCRIPTION,
+            "model_variant": args.model_variant,
             "train_size": TRAIN_SIZE,
             "max_epochs": MAX_EPOCHS,
             "base_lr": BASE_LR,
@@ -358,8 +360,18 @@ def main(args) -> None:
         worker_init_fn=seed_worker,
     )
 
-    model = Model(in_channels=3, n_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
-    ema_model = Model(in_channels=3, n_classes=NUM_CLASSES, dropout=DROPOUT).to(device)
+    model = Model(in_channels=3, n_classes=NUM_CLASSES, variant=args.model_variant, dropout=DROPOUT)
+    pretrained_path = f"./mit-{args.model_variant}"
+    pretrained_loaded = False
+    try:
+        model.load_pretrained(pretrained_path)
+        pretrained_loaded = True
+    except Exception as exc:
+        print(f"Warning: Could not load pretrained weights from {pretrained_path}. {exc}")
+        print("Continuing with random initialization.")
+
+    model = model.to(device)
+    ema_model = Model(in_channels=3, n_classes=NUM_CLASSES, variant=args.model_variant, dropout=DROPOUT).to(device)
     ema_model.load_state_dict(model.state_dict())
     ema_model.eval()
     for parameter in ema_model.parameters():
@@ -377,8 +389,9 @@ def main(args) -> None:
     global_step = 0
     total_iters = MAX_EPOCHS * max(len(train_dataloader), 1)
 
-    print(f"Training {MODEL_NAME}")
+    print(f"Training {MODEL_NAME} ({args.model_variant})")
     print(MODEL_DESCRIPTION)
+    print(f"Pretrained MiT loaded: {pretrained_loaded}")
 
     for epoch in range(MAX_EPOCHS):
         print(f"Epoch {epoch + 1:04}/{MAX_EPOCHS:04}")
