@@ -6,10 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-MODEL_NAME = "segformer-pretrained-b0-b5"
+MODEL_NAME = "segformer-step8-official-cityscapes-pipeline-msfe-fpn-lovasz"
 MODEL_DESCRIPTION = (
-    "Full SegFormer branch with pretrained MiT encoder loading and support for "
-    "both the b0 and b5 variants."
+    "Pretrained SegFormer branch with the official Cityscapes-style resolution and "
+    "crop pipeline, plus an MSFE-FPN decoder, SyncBN, a 10x head LR multiplier, "
+    "and CE + Lovasz-Softmax training."
 )
 LAYER_NORM_EPS = 1e-6
 
@@ -45,7 +46,7 @@ def get_model_variant_config(variant: str) -> dict:
 
 def infer_model_variant_from_state_dict(state_dict: dict[str, torch.Tensor]) -> str:
     stage1_weight = state_dict.get("encoder.stage1.patch_embed.proj.weight")
-    decoder_proj = state_dict.get("decode_head.linear_c1.proj.weight")
+    decoder_proj = state_dict.get("decode_head.lateral_c1.conv.weight")
 
     if torch.is_tensor(stage1_weight):
         stage1_dim = int(stage1_weight.shape[0])
@@ -54,9 +55,9 @@ def infer_model_variant_from_state_dict(state_dict: dict[str, torch.Tensor]) -> 
                 return variant
 
     if torch.is_tensor(decoder_proj):
-        decoder_dim = int(decoder_proj.shape[0])
+        decoder_dim = int(decoder_proj.shape[1])
         for variant, config in MODEL_VARIANTS.items():
-            if config["decoder_embedding_dim"] == decoder_dim:
+            if config["embed_dims"][0] == decoder_dim:
                 return variant
 
     raise KeyError("Unable to infer the SegFormer variant from the checkpoint state dict.")
@@ -359,17 +360,82 @@ class MixVisionTransformerEncoder(nn.Module):
         return c1, c2, c3, c4
 
 
-class SegFormerMLP(nn.Module):
-    def __init__(self, input_dim: int, embedding_dim: int):
+class ConvSyncBNAct(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        padding: int | None = None,
+        activation: bool = True,
+    ):
         super().__init__()
-        self.proj = nn.Linear(input_dim, embedding_dim)
+        if padding is None:
+            padding = kernel_size // 2
+
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=False)
+        self.norm = nn.SyncBatchNorm(out_channels)
+        self.act = nn.ReLU(inplace=True) if activation else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.flatten(2).transpose(1, 2)
-        return self.proj(x)
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        return x
 
 
-class SegFormerHead(nn.Module):
+class PyramidPoolingModule(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        pool_scales: tuple[int, ...] = (2, 3, 6, 8),
+    ):
+        super().__init__()
+        reduction_dim = max(out_channels // len(pool_scales), 32)
+        self.reduce = ConvSyncBNAct(in_channels, out_channels, kernel_size=1, padding=0)
+        self.pool_branches = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.AdaptiveAvgPool2d(scale),
+                    ConvSyncBNAct(out_channels, reduction_dim, kernel_size=1, padding=0),
+                )
+                for scale in pool_scales
+            ]
+        )
+        fusion_channels = out_channels + len(pool_scales) * reduction_dim
+        self.fuse = ConvSyncBNAct(fusion_channels, out_channels, kernel_size=3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.reduce(x)
+        height, width = x.shape[-2:]
+        pooled_features = [x]
+        for branch in self.pool_branches:
+            pooled = branch(x)
+            pooled = F.interpolate(pooled, size=(height, width), mode="bilinear", align_corners=False)
+            pooled_features.append(pooled)
+        return self.fuse(torch.cat(pooled_features, dim=1))
+
+
+class ScaleAttentionFusion(nn.Module):
+    def __init__(self, channels: int, num_levels: int):
+        super().__init__()
+        self.attention_reduce = ConvSyncBNAct(channels * num_levels, channels, kernel_size=1, padding=0)
+        self.attention_pred = nn.Conv2d(channels, num_levels, kernel_size=1)
+        self.refine = ConvSyncBNAct(channels, channels, kernel_size=3)
+
+    def forward(self, features: list[torch.Tensor]) -> torch.Tensor:
+        if len(features) == 0:
+            raise ValueError("ScaleAttentionFusion requires at least one feature map.")
+
+        stacked = torch.stack(features, dim=1)
+        attention_logits = self.attention_pred(self.attention_reduce(torch.cat(features, dim=1)))
+        attention = torch.softmax(attention_logits, dim=1).unsqueeze(2)
+        fused = (stacked * attention).sum(dim=1)
+        return self.refine(fused)
+
+
+class MSFEFPNHead(nn.Module):
     def __init__(
         self,
         in_channels: tuple[int, int, int, int],
@@ -379,37 +445,46 @@ class SegFormerHead(nn.Module):
     ):
         super().__init__()
 
-        self.linear_c1 = SegFormerMLP(in_channels[0], embedding_dim)
-        self.linear_c2 = SegFormerMLP(in_channels[1], embedding_dim)
-        self.linear_c3 = SegFormerMLP(in_channels[2], embedding_dim)
-        self.linear_c4 = SegFormerMLP(in_channels[3], embedding_dim)
+        self.lateral_c1 = ConvSyncBNAct(in_channels[0], embedding_dim, kernel_size=1, padding=0)
+        self.lateral_c2 = ConvSyncBNAct(in_channels[1], embedding_dim, kernel_size=1, padding=0)
+        self.lateral_c3 = ConvSyncBNAct(in_channels[2], embedding_dim, kernel_size=1, padding=0)
+        self.context_c4 = PyramidPoolingModule(in_channels[3], embedding_dim)
 
-        self.linear_fuse = nn.Sequential(
-            nn.Conv2d(embedding_dim * 4, embedding_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(embedding_dim),
-            nn.ReLU(inplace=True),
-        )
+        self.refine_c4 = ConvSyncBNAct(embedding_dim, embedding_dim, kernel_size=3)
+        self.refine_c3 = ConvSyncBNAct(embedding_dim, embedding_dim, kernel_size=3)
+        self.refine_c2 = ConvSyncBNAct(embedding_dim, embedding_dim, kernel_size=3)
+        self.refine_c1 = ConvSyncBNAct(embedding_dim, embedding_dim, kernel_size=3)
+
+        self.scale_attention = ScaleAttentionFusion(embedding_dim, num_levels=4)
+        self.fuse = ConvSyncBNAct(embedding_dim * 5, embedding_dim, kernel_size=3)
         self.dropout = nn.Dropout2d(dropout)
-        self.linear_pred = nn.Conv2d(embedding_dim, n_classes, kernel_size=1)
+        self.classifier = nn.Conv2d(embedding_dim, n_classes, kernel_size=1)
 
     def forward(self, features: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
         c1, c2, c3, c4 = features
-        batch_size = c4.shape[0]
-        height, width = c1.shape[-2:]
+        target_size = c1.shape[-2:]
 
-        c1 = self.linear_c1(c1).permute(0, 2, 1).reshape(batch_size, -1, c1.shape[2], c1.shape[3])
-        c2 = self.linear_c2(c2).permute(0, 2, 1).reshape(batch_size, -1, c2.shape[2], c2.shape[3])
-        c3 = self.linear_c3(c3).permute(0, 2, 1).reshape(batch_size, -1, c3.shape[2], c3.shape[3])
-        c4 = self.linear_c4(c4).permute(0, 2, 1).reshape(batch_size, -1, c4.shape[2], c4.shape[3])
+        p4 = self.refine_c4(self.context_c4(c4))
+        p3 = self.refine_c3(
+            self.lateral_c3(c3) + F.interpolate(p4, size=c3.shape[-2:], mode="bilinear", align_corners=False)
+        )
+        p2 = self.refine_c2(
+            self.lateral_c2(c2) + F.interpolate(p3, size=c2.shape[-2:], mode="bilinear", align_corners=False)
+        )
+        p1 = self.refine_c1(
+            self.lateral_c1(c1) + F.interpolate(p2, size=target_size, mode="bilinear", align_corners=False)
+        )
 
-        c2 = F.interpolate(c2, size=(height, width), mode="bilinear", align_corners=False)
-        c3 = F.interpolate(c3, size=(height, width), mode="bilinear", align_corners=False)
-        c4 = F.interpolate(c4, size=(height, width), mode="bilinear", align_corners=False)
-
-        x = torch.cat([c4, c3, c2, c1], dim=1)
-        x = self.linear_fuse(x)
+        aligned_features = [
+            p1,
+            F.interpolate(p2, size=target_size, mode="bilinear", align_corners=False),
+            F.interpolate(p3, size=target_size, mode="bilinear", align_corners=False),
+            F.interpolate(p4, size=target_size, mode="bilinear", align_corners=False),
+        ]
+        attended_feature = self.scale_attention(aligned_features)
+        x = self.fuse(torch.cat(aligned_features + [attended_feature], dim=1))
         x = self.dropout(x)
-        return self.linear_pred(x)
+        return self.classifier(x)
 
 
 class Model(nn.Module):
@@ -442,7 +517,7 @@ class Model(nn.Module):
             mlp_drop=mlp_drop,
             drop_path_rate=self.config["drop_path_rate"],
         )
-        self.decode_head = SegFormerHead(
+        self.decode_head = MSFEFPNHead(
             in_channels=self.config["embed_dims"],
             embedding_dim=self.config["decoder_embedding_dim"],
             n_classes=n_classes,
@@ -455,7 +530,7 @@ class Model(nn.Module):
             nn.init.trunc_normal_(module.weight, std=0.02)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
-        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm2d)):
+        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm2d, nn.SyncBatchNorm)):
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
         elif isinstance(module, nn.Conv2d):

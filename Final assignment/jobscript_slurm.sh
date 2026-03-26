@@ -9,4 +9,4 @@
 srun apptainer exec --nv --env-file .env container.sif /bin/bash main.sh \
   --model-variant b5 \
   --batch-size 1 \
-  --experiment-id segformer-step8-official-cityscapes-pipeline-b5
+  --experiment-id segformer-step8-official-cityscapes-pipeline-msfe-fpn-lovasz-b5

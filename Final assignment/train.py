@@ -35,6 +35,7 @@ WEIGHT_DECAY = 1e-2
 WARMUP_ITERS = 1500
 POLY_POWER = 0.9
 MIN_LR_RATIO = 1e-3
+HEAD_LR_MULTIPLIER = 10.0
 HFLIP_PROB = 0.5
 COLOR_JITTER = 0.4
 GAUSSIAN_BLUR = 0.0
@@ -44,6 +45,7 @@ EARLY_STOP_MIN_DELTA = 1e-4
 EVAL_SCALES = (0.75, 1.0, 1.25)
 EVAL_FLIP = True
 DROPOUT = 0.1
+LOVASZ_LOSS_WEIGHT = 1.0
 
 
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -96,7 +98,6 @@ def resize_logits(logits: torch.Tensor, target_size: tuple[int, int]) -> torch.T
         return logits
     return F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
 
-
 def sample_class_balanced_crop(
     target: torch.Tensor,
     crop_size: tuple[int, int],
@@ -129,6 +130,62 @@ def sample_class_balanced_crop(
             return top, left
 
     return top, left
+
+
+def lovasz_gradient(sorted_ground_truth: torch.Tensor) -> torch.Tensor:
+    total_positive = sorted_ground_truth.sum()
+    intersection = total_positive - sorted_ground_truth.cumsum(dim=0)
+    union = total_positive + (1.0 - sorted_ground_truth).cumsum(dim=0)
+    jaccard = 1.0 - intersection / union
+    if sorted_ground_truth.numel() > 1:
+        jaccard[1:] = jaccard[1:] - jaccard[:-1]
+    return jaccard
+
+
+def flatten_probabilities(
+    probabilities: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    probabilities = probabilities.permute(0, 2, 3, 1).reshape(-1, probabilities.shape[1])
+    labels = labels.reshape(-1)
+    if ignore_index is None:
+        return probabilities, labels
+
+    valid = labels != ignore_index
+    return probabilities[valid], labels[valid]
+
+
+def lovasz_softmax_flat(probabilities: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    if probabilities.numel() == 0:
+        return probabilities.sum() * 0.0
+
+    losses = []
+    num_classes = probabilities.shape[1]
+    for class_index in range(num_classes):
+        foreground = (labels == class_index).float()
+        if foreground.sum() == 0:
+            continue
+
+        class_predictions = probabilities[:, class_index]
+        errors = (foreground - class_predictions).abs()
+        errors_sorted, permutation = torch.sort(errors, descending=True)
+        foreground_sorted = foreground[permutation]
+        losses.append(torch.dot(errors_sorted, lovasz_gradient(foreground_sorted)))
+
+    if not losses:
+        return probabilities.sum() * 0.0
+    return torch.stack(losses).mean()
+
+
+def lovasz_softmax_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = IGNORE_INDEX,
+) -> torch.Tensor:
+    probabilities = F.softmax(logits, dim=1)
+    probabilities, labels = flatten_probabilities(probabilities, labels, ignore_index=ignore_index)
+    return lovasz_softmax_flat(probabilities, labels)
 
 
 def poly_lr(
@@ -372,10 +429,12 @@ def main(args) -> None:
             "train_cat_max_ratio": TRAIN_CAT_MAX_RATIO,
             "max_epochs": MAX_EPOCHS,
             "base_lr": BASE_LR,
+            "head_lr_multiplier": HEAD_LR_MULTIPLIER,
             "weight_decay": WEIGHT_DECAY,
             "warmup_iters": WARMUP_ITERS,
             "poly_power": POLY_POWER,
             "min_lr_ratio": MIN_LR_RATIO,
+            "lovasz_loss_weight": LOVASZ_LOSS_WEIGHT,
             "ema_decay": EMA_DECAY,
             "early_stop_patience": EARLY_STOP_PATIENCE,
             "early_stop_min_delta": EARLY_STOP_MIN_DELTA,
@@ -432,8 +491,24 @@ def main(args) -> None:
     for parameter in ema_model.parameters():
         parameter.requires_grad = False
 
-    criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
-    optimizer = AdamW(model.parameters(), lr=BASE_LR, weight_decay=WEIGHT_DECAY)
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
+    backbone_parameters = []
+    head_parameters = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("decode_head."):
+            head_parameters.append(parameter)
+        else:
+            backbone_parameters.append(parameter)
+
+    optimizer = AdamW(
+        [
+            {"params": backbone_parameters, "lr": BASE_LR},
+            {"params": head_parameters, "lr": BASE_LR * HEAD_LR_MULTIPLIER},
+        ],
+        weight_decay=WEIGHT_DECAY,
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     best_valid_loss = float("inf")
@@ -453,6 +528,8 @@ def main(args) -> None:
 
         model.train()
         train_losses = []
+        train_ce_losses = []
+        train_lovasz_losses = []
         for images, labels in train_dataloader:
             labels = convert_to_train_id(labels)
             images = images.to(device, non_blocking=True)
@@ -466,14 +543,16 @@ def main(args) -> None:
                 power=POLY_POWER,
                 min_lr_ratio=MIN_LR_RATIO,
             )
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = current_lr
+            optimizer.param_groups[0]["lr"] = current_lr
+            optimizer.param_groups[1]["lr"] = current_lr * HEAD_LR_MULTIPLIER
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(amp_enabled):
                 outputs = model(images)
                 outputs = resize_logits(outputs, labels.shape[-2:])
-                loss = criterion(outputs, labels)
+                ce_loss = ce_criterion(outputs, labels)
+            lovasz_loss = lovasz_softmax_loss(outputs.float(), labels)
+            loss = ce_loss + LOVASZ_LOSS_WEIGHT * lovasz_loss
 
             if not torch.isfinite(loss):
                 raise RuntimeError("Non-finite loss encountered; try lowering the learning rate.")
@@ -486,10 +565,15 @@ def main(args) -> None:
             update_ema_model(ema_model, model, EMA_DECAY)
 
             train_losses.append(loss.item())
+            train_ce_losses.append(ce_loss.item())
+            train_lovasz_losses.append(lovasz_loss.item())
             wandb.log(
                 {
                     "train_loss": loss.item(),
+                    "train_ce_loss": ce_loss.item(),
+                    "train_lovasz_loss": lovasz_loss.item(),
                     "learning_rate": optimizer.param_groups[0]["lr"],
+                    "head_learning_rate": optimizer.param_groups[1]["lr"],
                     "epoch": epoch + 1,
                 },
                 step=global_step,
@@ -501,6 +585,8 @@ def main(args) -> None:
 
         with torch.no_grad():
             valid_losses = []
+            valid_ce_losses = []
+            valid_lovasz_losses = []
             confusion_matrix = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.int64, device=device)
 
             for batch_index, (images, labels) in enumerate(valid_dataloader):
@@ -515,8 +601,12 @@ def main(args) -> None:
                     flip=EVAL_FLIP,
                     amp_enabled=amp_enabled,
                 )
-                loss = criterion(outputs, labels)
+                ce_loss = ce_criterion(outputs, labels)
+                lovasz_loss = lovasz_softmax_loss(outputs.float(), labels)
+                loss = ce_loss + LOVASZ_LOSS_WEIGHT * lovasz_loss
                 valid_losses.append(loss.item())
+                valid_ce_losses.append(ce_loss.item())
+                valid_lovasz_losses.append(lovasz_loss.item())
                 update_confusion_matrix(confusion_matrix, outputs, labels, num_classes=NUM_CLASSES)
 
                 if batch_index == 0:
@@ -538,7 +628,11 @@ def main(args) -> None:
                     )
 
             train_loss = sum(train_losses) / max(len(train_losses), 1)
+            train_ce_loss = sum(train_ce_losses) / max(len(train_ce_losses), 1)
+            train_lovasz_loss = sum(train_lovasz_losses) / max(len(train_lovasz_losses), 1)
             valid_loss = sum(valid_losses) / max(len(valid_losses), 1)
+            valid_ce_loss = sum(valid_ce_losses) / max(len(valid_ce_losses), 1)
+            valid_lovasz_loss = sum(valid_lovasz_losses) / max(len(valid_lovasz_losses), 1)
             valid_miou = compute_mean_iou(confusion_matrix)
             valid_mean_dice = compute_mean_dice(confusion_matrix)
             improved = valid_mean_dice > best_dice + EARLY_STOP_MIN_DELTA
@@ -564,7 +658,11 @@ def main(args) -> None:
                 {
                     "epoch": epoch + 1,
                     "epoch_train_loss": train_loss,
+                    "epoch_train_ce_loss": train_ce_loss,
+                    "epoch_train_lovasz_loss": train_lovasz_loss,
                     "valid_loss": valid_loss,
+                    "valid_ce_loss": valid_ce_loss,
+                    "valid_lovasz_loss": valid_lovasz_loss,
                     "valid_miou": valid_miou,
                     "valid_mean_dice": valid_mean_dice,
                     "best_valid_mean_dice": best_dice,
