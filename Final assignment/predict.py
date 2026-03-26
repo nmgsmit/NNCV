@@ -15,7 +15,7 @@ from model import Model, infer_model_variant_from_state_dict
 IMAGE_DIR = "/data"
 OUTPUT_DIR = "/output"
 MODEL_PATH = "/app/model.pt"
-IMAGE_SIZE = (512, 1024)
+IMAGE_SIZE = (1024, 2048)
 CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
 CITYSCAPES_STD = (0.229, 0.224, 0.225)
 
