@@ -42,6 +42,9 @@ EVAL_SCALES = (0.75, 1.0, 1.25)
 EVAL_FLIP = True
 DROPOUT = 0.1
 LOVASZ_LOSS_WEIGHT = 1.0
+WEATHER_AUG_PROB = 0.6
+DOMAIN_SHIFT_PROB = 0.4
+SHADOW_PROB = 0.25
 
 
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -224,9 +227,101 @@ def compute_mean_dice(confusion_matrix: torch.Tensor) -> float:
     return ((2.0 * true_positives[valid]) / denominator[valid]).mean().item()
 
 
+class RobustnessAugmentor:
+    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+        if random.random() < WEATHER_AUG_PROB:
+            image = random.choice(
+                [self.apply_fog, self.apply_rain, self.apply_snow, self.apply_low_light]
+            )(image)
+
+        if random.random() < DOMAIN_SHIFT_PROB:
+            image = self.apply_domain_shift(image)
+
+        if random.random() < SHADOW_PROB:
+            image = self.apply_shadow(image)
+
+        return image.clamp(0.0, 1.0)
+
+    def smooth_noise(self, image: torch.Tensor, scale: int = 16) -> torch.Tensor:
+        height, width = image.shape[-2:]
+        coarse_height = max(2, height // scale)
+        coarse_width = max(2, width // scale)
+        noise = torch.rand((1, 1, coarse_height, coarse_width), dtype=image.dtype)
+        noise = F.interpolate(noise, size=(height, width), mode="bilinear", align_corners=False)
+        noise = F.avg_pool2d(noise, kernel_size=5, stride=1, padding=2)
+        return noise.squeeze(0)
+
+    def apply_fog(self, image: torch.Tensor) -> torch.Tensor:
+        haze = self.smooth_noise(image, scale=20)
+        strength = random.uniform(0.2, 0.45)
+        fog = 0.75 + 0.25 * haze
+        image = image * (1.0 - strength) + fog.expand_as(image) * strength
+        image = TF.adjust_contrast(image, random.uniform(0.6, 0.85))
+        return image
+
+    def apply_low_light(self, image: torch.Tensor) -> torch.Tensor:
+        gamma = random.uniform(1.4, 2.4)
+        brightness = random.uniform(0.35, 0.7)
+        sensor_noise = torch.randn_like(image) * random.uniform(0.01, 0.03)
+        image = TF.adjust_gamma(image, gamma=gamma)
+        image = image * brightness + sensor_noise
+        return image
+
+    def apply_rain(self, image: torch.Tensor) -> torch.Tensor:
+        height, width = image.shape[-2:]
+        rain_mask = (torch.rand((1, 1, height, width), dtype=image.dtype) > 0.992).float()
+        kernel = torch.zeros((1, 1, 9, 9), dtype=image.dtype)
+        if random.random() < 0.5:
+            for index in range(9):
+                kernel[0, 0, index, index] = 1.0
+        else:
+            for index in range(9):
+                kernel[0, 0, index, 8 - index] = 1.0
+
+        streaks = F.conv2d(rain_mask, kernel / kernel.sum(), padding=4)
+        streaks = F.avg_pool2d(streaks, kernel_size=3, stride=1, padding=1).squeeze(0)
+        strength = random.uniform(0.15, 0.3)
+        image = TF.adjust_brightness(image, random.uniform(0.75, 0.95))
+        image = TF.adjust_contrast(image, random.uniform(0.7, 0.9))
+        image = image + streaks.expand_as(image) * strength
+        return image
+
+    def apply_snow(self, image: torch.Tensor) -> torch.Tensor:
+        snow = self.smooth_noise(image, scale=10)
+        snow = (snow > snow.mean() + 0.35 * snow.std()).float()
+        snow = F.avg_pool2d(snow.unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0)
+        haze_strength = random.uniform(0.05, 0.15)
+        snow_strength = random.uniform(0.15, 0.3)
+        image = TF.adjust_saturation(image, random.uniform(0.7, 0.95))
+        image = image * (1.0 - haze_strength) + haze_strength
+        image = image + snow.expand_as(image) * snow_strength
+        return image
+
+    def apply_domain_shift(self, image: torch.Tensor) -> torch.Tensor:
+        channel_gain = torch.empty((image.shape[0], 1, 1), dtype=image.dtype).uniform_(0.8, 1.2)
+        channel_bias = torch.empty((image.shape[0], 1, 1), dtype=image.dtype).uniform_(-0.08, 0.08)
+        image = image * channel_gain + channel_bias
+        image = TF.adjust_contrast(image, random.uniform(0.7, 1.35))
+        image = TF.adjust_saturation(image, random.uniform(0.6, 1.4))
+        image = TF.adjust_hue(image, random.uniform(-0.08, 0.08))
+        return image
+
+    def apply_shadow(self, image: torch.Tensor) -> torch.Tensor:
+        height, width = image.shape[-2:]
+        y_coords = torch.linspace(0.0, 1.0, steps=height, dtype=image.dtype).view(1, height, 1)
+        x_coords = torch.linspace(0.0, 1.0, steps=width, dtype=image.dtype).view(1, 1, width)
+        mask = y_coords.expand(1, height, width) if random.random() < 0.5 else x_coords.expand(1, height, width)
+        if random.random() < 0.5:
+            mask = 1.0 - mask
+        shadow_strength = random.uniform(0.2, 0.45)
+        shadow = 1.0 - shadow_strength * mask
+        return image * shadow
+
+
 class CityscapesJointTransform:
     def __init__(self, training: bool):
         self.training = training
+        self.robustness_augmentor = RobustnessAugmentor()
 
         self.eval_image_transform = Compose([
             ToImage(),
@@ -278,11 +373,12 @@ class CityscapesJointTransform:
             target = TF.hflip(target)
 
         image = ToImage()(image)
+        image = ToDtype(torch.float32, scale=True)(image)
         image = self.color_jitter(image)
+        image = self.robustness_augmentor(image)
         if GAUSSIAN_BLUR > 0.0 and random.random() < GAUSSIAN_BLUR:
             image = F_v2.gaussian_blur(image, kernel_size=3)
 
-        image = ToDtype(torch.float32, scale=True)(image)
         image = Normalize(CITYSCAPES_MEAN, CITYSCAPES_STD)(image)
         target = ToDtype(torch.int64)(ToImage()(target))
         return image, target
@@ -381,6 +477,9 @@ def main(args) -> None:
             "poly_power": POLY_POWER,
             "min_lr_ratio": MIN_LR_RATIO,
             "lovasz_loss_weight": LOVASZ_LOSS_WEIGHT,
+            "weather_aug_prob": WEATHER_AUG_PROB,
+            "domain_shift_prob": DOMAIN_SHIFT_PROB,
+            "shadow_prob": SHADOW_PROB,
             "ema_decay": EMA_DECAY,
             "early_stop_patience": EARLY_STOP_PATIENCE,
             "early_stop_min_delta": EARLY_STOP_MIN_DELTA,

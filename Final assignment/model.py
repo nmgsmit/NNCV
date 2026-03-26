@@ -6,11 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-MODEL_NAME = "segformer-step7-2-msfe-fpn-syncbn-lovasz"
+MODEL_NAME = "segformer-robust"
 MODEL_DESCRIPTION = (
-    "Pretrained SegFormer branch with the lighter step-7.1 training recipe and an "
-    "MSFE-FPN decoder that adds pyramid pooling, top-down multi-scale fusion, "
-    "attention-guided feature aggregation, and SyncBN."
+    "Robust SegFormer branch built on step 7.2, using the MSFE-FPN decoder with "
+    "SyncBN together with stronger domain-generalization augmentations for fog, rain, "
+    "snow, low-light conditions, and broader appearance shift."
 )
 LAYER_NORM_EPS = 1e-6
 
