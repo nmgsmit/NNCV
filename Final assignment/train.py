@@ -29,7 +29,7 @@ TRAIN_CROP_SIZE = (1024, 1024)
 TRAIN_RATIO_RANGE = (0.5, 2.0)
 TRAIN_CAT_MAX_RATIO = 0.75
 DEFAULT_BATCH_SIZE = 1
-MAX_EPOCHS = 50
+MAX_EPOCHS = 30
 BASE_LR = 6e-5
 WEIGHT_DECAY = 1e-2
 WARMUP_ITERS = 1500
@@ -40,8 +40,6 @@ HFLIP_PROB = 0.5
 COLOR_JITTER = 0.4
 GAUSSIAN_BLUR = 0.0
 EMA_DECAY = 0.999
-EARLY_STOP_PATIENCE = 12
-EARLY_STOP_MIN_DELTA = 1e-4
 EVAL_SCALES = (0.75, 1.0, 1.25)
 EVAL_FLIP = True
 DROPOUT = 0.1
@@ -469,8 +467,6 @@ def main(args) -> None:
             "min_lr_ratio": MIN_LR_RATIO,
             "lovasz_loss_weight": LOVASZ_LOSS_WEIGHT,
             "ema_decay": EMA_DECAY,
-            "early_stop_patience": EARLY_STOP_PATIENCE,
-            "early_stop_min_delta": EARLY_STOP_MIN_DELTA,
             "eval_scales": EVAL_SCALES,
             "eval_flip": EVAL_FLIP,
             "dropout": DROPOUT,
@@ -563,11 +559,6 @@ def main(args) -> None:
     )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
-    best_valid_loss = float("inf")
-    best_miou = -float("inf")
-    best_dice = -float("inf")
-    current_best_model_path = None
-    epochs_without_improvement = 0
     global_step = 0
     total_iters = MAX_EPOCHS * max(len(train_dataloader), 1)
 
@@ -695,24 +686,6 @@ def main(args) -> None:
             valid_lovasz_loss = sum(valid_lovasz_losses) / max(len(valid_lovasz_losses), 1)
             valid_miou = compute_mean_iou(confusion_matrix)
             valid_mean_dice = compute_mean_dice(confusion_matrix)
-            improved = valid_mean_dice > best_dice + EARLY_STOP_MIN_DELTA
-
-            if improved:
-                best_dice = valid_mean_dice
-                best_miou = valid_miou
-                best_valid_loss = valid_loss
-                epochs_without_improvement = 0
-
-                if current_best_model_path and os.path.exists(current_best_model_path):
-                    os.remove(current_best_model_path)
-
-                current_best_model_path = os.path.join(
-                    output_dir,
-                    f"best_model-epoch={epoch:04}-dice={valid_mean_dice:.4f}-miou={valid_miou:.4f}-val_loss={valid_loss:.4f}.pt",
-                )
-                torch.save(ema_model.state_dict(), current_best_model_path)
-            else:
-                epochs_without_improvement += 1
 
             wandb.log(
                 {
@@ -725,24 +698,15 @@ def main(args) -> None:
                     "valid_lovasz_loss": valid_lovasz_loss,
                     "valid_miou": valid_miou,
                     "valid_mean_dice": valid_mean_dice,
-                    "best_valid_mean_dice": best_dice,
-                    "epochs_without_improvement": epochs_without_improvement,
                 },
                 step=max(global_step - 1, 0),
             )
-
-            if epochs_without_improvement >= EARLY_STOP_PATIENCE:
-                print(
-                    f"Early stopping at epoch {epoch + 1}: "
-                    f"no mean Dice improvement for {EARLY_STOP_PATIENCE} epochs."
-                )
-                break
 
     print("Training complete!")
 
     final_model_path = os.path.join(
         output_dir,
-        f"final_model-epoch={epoch:04}-dice={best_dice:.4f}-miou={best_miou:.4f}-val_loss={best_valid_loss:.4f}.pt",
+        f"final_model-epoch={epoch:04}-dice={valid_mean_dice:.4f}-miou={valid_miou:.4f}-val_loss={valid_loss:.4f}.pt",
     )
     torch.save(ema_model.state_dict(), final_model_path)
     wandb.finish()
