@@ -1,11 +1,12 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=18
+#SBATCH --cpus-per-task=16
 #SBATCH --gpus=1
-#SBATCH --partition=gpu_a100
-#SBATCH --time=04:00:00
+#SBATCH --partition=gpu_h100
+#SBATCH --time=24:00:00
 
 srun apptainer exec --nv --env-file .env container.sif /bin/bash main.sh \
   --model-variant b5 \
-  --experiment-id segformer-robust-b5
+  --batch-size 1 \
+  --experiment-id segformer-robust-v2-b5

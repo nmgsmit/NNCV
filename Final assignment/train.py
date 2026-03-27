@@ -24,7 +24,11 @@ IGNORE_INDEX = 255
 NUM_CLASSES = 19
 CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
 CITYSCAPES_STD = (0.229, 0.224, 0.225)
-TRAIN_SIZE = (512, 1024)
+BASE_IMAGE_SIZE = (1024, 2048)
+TRAIN_CROP_SIZE = (1024, 1024)
+TRAIN_RATIO_RANGE = (0.5, 2.0)
+TRAIN_CAT_MAX_RATIO = 0.75
+DEFAULT_BATCH_SIZE = 1
 MAX_EPOCHS = 50
 BASE_LR = 6e-5
 WEIGHT_DECAY = 1e-2
@@ -48,12 +52,13 @@ SHADOW_PROB = 0.25
 
 
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
+id_to_trainid[IGNORE_INDEX] = IGNORE_INDEX
 train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cls.train_id != IGNORE_INDEX}
 train_id_to_color[IGNORE_INDEX] = (0, 0, 0)
 
 
 def convert_to_train_id(label_img: torch.Tensor) -> torch.Tensor:
-    return label_img.apply_(lambda x: id_to_trainid[x])
+    return label_img.apply_(lambda x: id_to_trainid.get(int(x), IGNORE_INDEX))
 
 
 def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
@@ -95,6 +100,40 @@ def resize_logits(logits: torch.Tensor, target_size: tuple[int, int]) -> torch.T
     if logits.shape[-2:] == target_size:
         return logits
     return F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
+
+
+def sample_class_balanced_crop(
+    target: torch.Tensor,
+    crop_size: tuple[int, int],
+    ignore_index: int = IGNORE_INDEX,
+    cat_max_ratio: float = TRAIN_CAT_MAX_RATIO,
+    num_classes: int = NUM_CLASSES,
+    max_attempts: int = 10,
+) -> tuple[int, int]:
+    crop_height, crop_width = crop_size
+    image_height, image_width = target.shape[-2:]
+    max_top = max(image_height - crop_height, 0)
+    max_left = max(image_width - crop_width, 0)
+
+    top = 0
+    left = 0
+    for _ in range(max_attempts):
+        top = 0 if max_top == 0 else random.randint(0, max_top)
+        left = 0 if max_left == 0 else random.randint(0, max_left)
+
+        current_height = min(crop_height, image_height)
+        current_width = min(crop_width, image_width)
+        crop = TF.crop(target, top, left, current_height, current_width).to(torch.int64).squeeze(0)
+        valid = crop != ignore_index
+        if not valid.any():
+            return top, left
+
+        class_histogram = torch.bincount(crop[valid].flatten(), minlength=num_classes)
+        total = class_histogram.sum()
+        if total == 0 or (class_histogram.max().float() / total.float()) < cat_max_ratio:
+            return top, left
+
+    return top, left
 
 
 def lovasz_gradient(sorted_ground_truth: torch.Tensor) -> torch.Tensor:
@@ -325,13 +364,13 @@ class CityscapesJointTransform:
 
         self.eval_image_transform = Compose([
             ToImage(),
-            Resize(TRAIN_SIZE, interpolation=InterpolationMode.BILINEAR, antialias=True),
+            Resize(BASE_IMAGE_SIZE, interpolation=InterpolationMode.BILINEAR, antialias=True),
             ToDtype(torch.float32, scale=True),
             Normalize(CITYSCAPES_MEAN, CITYSCAPES_STD),
         ])
         self.eval_target_transform = Compose([
             ToImage(),
-            Resize(TRAIN_SIZE, interpolation=InterpolationMode.NEAREST),
+            Resize(BASE_IMAGE_SIZE, interpolation=InterpolationMode.NEAREST),
             ToDtype(torch.int64),
         ])
         self.color_jitter = v2.ColorJitter(
@@ -347,32 +386,39 @@ class CityscapesJointTransform:
             target = self.eval_target_transform(target)
             return image, target
 
-        i, j, h, w = v2.RandomResizedCrop.get_params(image, scale=(0.5, 2.0), ratio=(1.5, 2.0))
-        image = TF.resized_crop(
-            image,
-            i,
-            j,
-            h,
-            w,
-            TRAIN_SIZE,
-            interpolation=InterpolationMode.BILINEAR,
-            antialias=True,
+        scale = random.uniform(*TRAIN_RATIO_RANGE)
+        scaled_size = (
+            max(1, int(round(BASE_IMAGE_SIZE[0] * scale))),
+            max(1, int(round(BASE_IMAGE_SIZE[1] * scale))),
         )
-        target = TF.resized_crop(
+
+        image = ToImage()(image)
+        target = ToImage()(target)
+        image = TF.resize(image, scaled_size, interpolation=InterpolationMode.BILINEAR, antialias=True)
+        target = TF.resize(target, scaled_size, interpolation=InterpolationMode.NEAREST)
+
+        top, left = sample_class_balanced_crop(
             target,
-            i,
-            j,
-            h,
-            w,
-            TRAIN_SIZE,
-            interpolation=InterpolationMode.NEAREST,
+            crop_size=TRAIN_CROP_SIZE,
+            ignore_index=IGNORE_INDEX,
+            cat_max_ratio=TRAIN_CAT_MAX_RATIO,
         )
+        current_height = min(TRAIN_CROP_SIZE[0], image.shape[-2])
+        current_width = min(TRAIN_CROP_SIZE[1], image.shape[-1])
+        image = TF.crop(image, top, left, current_height, current_width)
+        target = TF.crop(target, top, left, current_height, current_width)
+
+        pad_height = max(TRAIN_CROP_SIZE[0] - image.shape[-2], 0)
+        pad_width = max(TRAIN_CROP_SIZE[1] - image.shape[-1], 0)
+        if pad_height > 0 or pad_width > 0:
+            padding = [0, 0, pad_width, pad_height]
+            image = TF.pad(image, padding, fill=0)
+            target = TF.pad(target, padding, fill=IGNORE_INDEX)
 
         if random.random() < HFLIP_PROB:
             image = TF.hflip(image)
             target = TF.hflip(target)
 
-        image = ToImage()(image)
         image = ToDtype(torch.float32, scale=True)(image)
         image = self.color_jitter(image)
         image = self.robustness_augmentor(image)
@@ -439,7 +485,7 @@ def multi_scale_inference(
 def get_args_parser() -> ArgumentParser:
     parser = ArgumentParser("Training script for the SegFormer progression experiments")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to the training data")
-    parser.add_argument("--batch-size", type=int, default=4, help="Training batch size")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Training batch size")
     parser.add_argument("--num-workers", type=int, default=default_num_workers(), help="Number of workers for data loaders")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default=None, help="Optional W&B run name override")
@@ -453,6 +499,12 @@ def main(args) -> None:
     experiment_id = args.experiment_id or f"{MODEL_NAME}-{args.model_variant}"
     output_dir = os.path.join("checkpoints", experiment_id)
     os.makedirs(output_dir, exist_ok=True)
+
+    if args.model_variant == "b5" and TRAIN_CROP_SIZE == (1024, 1024) and args.batch_size > 1:
+        print(
+            "Warning: SegFormer-B5 with 1024x1024 crops usually requires batch_size=1 on a 40GB GPU. "
+            "If you hit CUDA OOM, rerun with --batch-size 1."
+        )
 
     seed_everything(args.seed)
     torch.backends.cudnn.deterministic = True
@@ -468,7 +520,10 @@ def main(args) -> None:
             "model_name": MODEL_NAME,
             "model_description": MODEL_DESCRIPTION,
             "model_variant": args.model_variant,
-            "train_size": TRAIN_SIZE,
+            "base_image_size": BASE_IMAGE_SIZE,
+            "train_crop_size": TRAIN_CROP_SIZE,
+            "train_ratio_range": TRAIN_RATIO_RANGE,
+            "train_cat_max_ratio": TRAIN_CAT_MAX_RATIO,
             "max_epochs": MAX_EPOCHS,
             "base_lr": BASE_LR,
             "head_lr_multiplier": HEAD_LR_MULTIPLIER,
