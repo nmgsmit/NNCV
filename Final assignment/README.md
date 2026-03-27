@@ -196,6 +196,14 @@ This side branch builds on v7.2 and focuses on domain robustness rather than pur
 
 Relevant sources: [Benchmarking Neural Network Robustness to Common Corruptions and Perturbations](https://arxiv.org/abs/1903.12261), [AugMix: A Simple Data Processing Method to Improve Robustness and Uncertainty](https://arxiv.org/abs/1912.02781), [FogAdapt: Self-Supervised Domain Adaptation for Semantic Segmentation of Foggy Images](https://arxiv.org/abs/2201.02588)
 
+### Robustness Branch v2
+
+Branch: `codex/segformer-robust-v2`
+
+This branch builds directly on the robust SegFormer variant and combines it with the stronger peak-performance pipeline. In training, it keeps the original robust augmentations for fog, rain, snow, low-light conditions, shadowing, and broader appearance shifts, but replaces the lighter resize-based pipeline with the official Cityscapes-style setup: full-resolution base sizing, random scale augmentation, class-balanced `1024x1024` crops, and full-resolution preprocessing for validation. In inference, it goes beyond the first robustness branch by adding multi-scale test-time augmentation and SegFix-style boundary refinement, making it the most complete robust SegFormer variant in the repository.
+
+Relevant sources: [SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers](https://arxiv.org/abs/2105.15203), [Cityscapes: The Cityscapes Dataset for Semantic Urban Scene Understanding](https://arxiv.org/abs/1604.01685), [Benchmarking Neural Network Robustness to Common Corruptions and Perturbations](https://arxiv.org/abs/1903.12261), [AugMix: A Simple Data Processing Method to Improve Robustness and Uncertainty](https://arxiv.org/abs/1912.02781), [FogAdapt: Self-Supervised Domain Adaptation for Semantic Segmentation of Foggy Images](https://arxiv.org/abs/2201.02588), [When and Why Test-Time Augmentation Works](https://arxiv.org/abs/2011.11156), [SegFix: Model-Agnostic Boundary Refinement for Segmentation](https://arxiv.org/abs/2007.04269)
+
 ### Efficiency Branch
 
 Branch: `codex/segformer-efficient-b0-segfix`
