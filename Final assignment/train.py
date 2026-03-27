@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torchvision.datasets import Cityscapes
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
@@ -46,6 +46,12 @@ EVAL_SCALES = (0.75, 1.0, 1.25)
 EVAL_FLIP = True
 DROPOUT = 0.1
 LOVASZ_LOSS_WEIGHT = 1.0
+HOLDOUT_FILENAMES = (
+    "tubingen_000047_000019_leftImg8bit.png",
+    "tubingen_000063_000019_leftImg8bit.png",
+    "tubingen_000126_000019_leftImg8bit.png",
+    "tubingen_000138_000019_leftImg8bit.png",
+)
 
 
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -334,9 +340,33 @@ class CityscapesJointTransform:
 
 
 class CityscapesSegmentationDataset(Dataset):
-    def __init__(self, root: str, split: str, transform: CityscapesJointTransform):
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        transform: CityscapesJointTransform,
+        include_filenames: set[str] | None = None,
+        exclude_filenames: set[str] | None = None,
+    ):
         self.dataset = Cityscapes(root, split=split, mode="fine", target_type="semantic")
         self.transform = transform
+        self.image_paths = list(self.dataset.images)
+        self.target_paths = [target[0] for target in self.dataset.targets]
+
+        if include_filenames is not None or exclude_filenames is not None:
+            filtered_indices = []
+            for index, image_path in enumerate(self.image_paths):
+                filename = os.path.basename(image_path)
+                if include_filenames is not None and filename not in include_filenames:
+                    continue
+                if exclude_filenames is not None and filename in exclude_filenames:
+                    continue
+                filtered_indices.append(index)
+
+            self.dataset.images = [self.dataset.images[index] for index in filtered_indices]
+            self.dataset.targets = [self.dataset.targets[index] for index in filtered_indices]
+            self.image_paths = [self.image_paths[index] for index in filtered_indices]
+            self.target_paths = [self.target_paths[index] for index in filtered_indices]
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -344,6 +374,9 @@ class CityscapesSegmentationDataset(Dataset):
     def __getitem__(self, index: int):
         image, target = self.dataset[index]
         return self.transform(image, target)
+
+    def filenames(self) -> list[str]:
+        return [os.path.basename(path) for path in self.image_paths]
 
 
 def multi_scale_inference(
@@ -445,13 +478,32 @@ def main(args) -> None:
             "num_workers": args.num_workers,
             "seed": args.seed,
             "amp": amp_enabled,
+            "holdout_filenames": HOLDOUT_FILENAMES,
         },
     )
 
     train_transform = CityscapesJointTransform(training=True)
     valid_transform = CityscapesJointTransform(training=False)
-    train_dataset = CityscapesSegmentationDataset(args.data_dir, split="train", transform=train_transform)
-    valid_dataset = CityscapesSegmentationDataset(args.data_dir, split="val", transform=valid_transform)
+    holdout_filenames = set(HOLDOUT_FILENAMES)
+    base_train_dataset = CityscapesSegmentationDataset(args.data_dir, split="train", transform=train_transform)
+    extra_train_dataset = CityscapesSegmentationDataset(
+        args.data_dir,
+        split="val",
+        transform=train_transform,
+        exclude_filenames=holdout_filenames,
+    )
+    valid_dataset = CityscapesSegmentationDataset(
+        args.data_dir,
+        split="val",
+        transform=valid_transform,
+        include_filenames=holdout_filenames,
+    )
+    train_dataset = ConcatDataset([base_train_dataset, extra_train_dataset])
+
+    missing_holdouts = sorted(holdout_filenames - set(valid_dataset.filenames()))
+    if missing_holdouts:
+        missing = ", ".join(missing_holdouts)
+        raise RuntimeError(f"Could not find all fixed holdout validation images in the Cityscapes val split: {missing}")
 
     persistent_workers = args.num_workers > 0
     train_dataloader = DataLoader(
@@ -466,7 +518,7 @@ def main(args) -> None:
     )
     valid_dataloader = DataLoader(
         valid_dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -522,6 +574,8 @@ def main(args) -> None:
     print(f"Training {MODEL_NAME} ({args.model_variant})")
     print(MODEL_DESCRIPTION)
     print(f"Pretrained MiT loaded: {pretrained_loaded}")
+    print(f"Training on {len(train_dataset)} images: {len(base_train_dataset)} from train + {len(extra_train_dataset)} from val.")
+    print(f"Using {len(valid_dataset)} fixed holdout validation images: {', '.join(valid_dataset.filenames())}")
 
     for epoch in range(MAX_EPOCHS):
         print(f"Epoch {epoch + 1:04}/{MAX_EPOCHS:04}")
@@ -588,8 +642,10 @@ def main(args) -> None:
             valid_ce_losses = []
             valid_lovasz_losses = []
             confusion_matrix = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.int64, device=device)
+            preview_predictions = []
+            preview_labels = []
 
-            for batch_index, (images, labels) in enumerate(valid_dataloader):
+            for images, labels in valid_dataloader:
                 labels = convert_to_train_id(labels)
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True).long().squeeze(1)
@@ -609,23 +665,27 @@ def main(args) -> None:
                 valid_lovasz_losses.append(lovasz_loss.item())
                 update_confusion_matrix(confusion_matrix, outputs, labels, num_classes=NUM_CLASSES)
 
-                if batch_index == 0:
-                    predictions = outputs.softmax(1).argmax(1, keepdim=True)
-                    labels_vis = labels.unsqueeze(1)
+                predictions = outputs.softmax(1).argmax(1, keepdim=True)
+                labels_vis = labels.unsqueeze(1)
 
-                    predictions = convert_train_id_to_color(predictions.cpu())
-                    labels_vis = convert_train_id_to_color(labels_vis.cpu())
+                preview_predictions.append(convert_train_id_to_color(predictions.cpu()))
+                preview_labels.append(convert_train_id_to_color(labels_vis.cpu()))
 
-                    predictions_img = make_grid(predictions, nrow=8).permute(1, 2, 0).numpy()
-                    labels_img = make_grid(labels_vis, nrow=8).permute(1, 2, 0).numpy()
+            if preview_predictions:
+                predictions = torch.cat(preview_predictions, dim=0)
+                labels_vis = torch.cat(preview_labels, dim=0)
+                grid_columns = min(2, predictions.shape[0])
 
-                    wandb.log(
-                        {
-                            "predictions": [wandb.Image(predictions_img)],
-                            "labels": [wandb.Image(labels_img)],
-                        },
-                        step=max(global_step - 1, 0),
-                    )
+                predictions_img = make_grid(predictions, nrow=grid_columns).permute(1, 2, 0).numpy()
+                labels_img = make_grid(labels_vis, nrow=grid_columns).permute(1, 2, 0).numpy()
+
+                wandb.log(
+                    {
+                        "predictions": [wandb.Image(predictions_img, caption="Fixed holdout predictions")],
+                        "labels": [wandb.Image(labels_img, caption="Fixed holdout labels")],
+                    },
+                    step=max(global_step - 1, 0),
+                )
 
             train_loss = sum(train_losses) / max(len(train_losses), 1)
             train_ce_loss = sum(train_ce_losses) / max(len(train_ce_losses), 1)
