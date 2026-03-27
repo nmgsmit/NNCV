@@ -86,7 +86,7 @@ Relevant sources: [Feature Pyramid Networks for Object Detection](https://arxiv.
 
 Branch: `codex/segformer-step8-official-cityscapes-pipeline`
 
-This branch keeps the stronger v7.2 model and adds the official-style Cityscapes input pipeline. It is designed to be much closer to a paper-like training setup, using full-resolution base sizing, random scale augmentation, `1024x1024` crops, class-balanced crop selection, and matching full-resolution preprocessing at inference. It is stronger, but also much heavier.
+This branch keeps the stronger v7.2 model and adds the official-style Cityscapes input pipeline. It is designed to be much closer to a paper-like training setup, using full-resolution base sizing, random scale augmentation, `1024x1024` crops, class-balanced crop selection, and matching full-resolution preprocessing at inference. In its current edited form, it also reuses most of the original validation split for training: the full training split is combined with the validation split except for 4 fixed Tubingen holdout images, which are kept only for monitoring and qualitative W\&B logging. It is stronger, but also much heavier.
 
 Relevant sources: [SegFormer: Simple and Efficient Design for Semantic Segmentation with Transformers](https://arxiv.org/abs/2105.15203), [Cityscapes: The Cityscapes Dataset for Semantic Urban Scene Understanding](https://arxiv.org/abs/1604.01685)
 
@@ -118,7 +118,7 @@ Relevant sources: [Benchmarking Neural Network Robustness to Common Corruptions 
 
 Branch: `codex/segformer-robust-v2`
 
-This branch builds directly on the robust SegFormer variant and combines it with the stronger peak-performance pipeline. In training, it keeps the original robust augmentations for fog, rain, snow, low-light conditions, shadowing, and broader appearance shifts, but replaces the lighter resize-based pipeline with the official Cityscapes-style setup: full-resolution base sizing, random scale augmentation, class-balanced `1024x1024` crops, and full-resolution preprocessing for validation. In inference, it goes beyond the first robustness branch by adding multi-scale test-time augmentation and SegFix-style boundary refinement, making it the most complete robust SegFormer variant in the repository.
+This branch builds directly on the robust SegFormer variant and combines it with the stronger peak-performance pipeline. In training, it keeps the original robust augmentations for fog, rain, snow, low-light conditions, shadowing, and broader appearance shifts, but replaces the lighter resize-based pipeline with the official Cityscapes-style setup: full-resolution base sizing, random scale augmentation, class-balanced `1024x1024` crops, and full-resolution preprocessing for validation. In its current edited form, it also follows the same data-usage pattern as the edited `v8` branch: the full training split is combined with the validation split except for 4 fixed Tubingen holdout images, which are kept only for monitoring and qualitative W\&B logging. In inference, it goes beyond the first robustness branch by adding multi-scale test-time augmentation and SegFix-style boundary refinement, making it the most complete robust SegFormer variant in the repository.
 
 In short, `segformer-robust-v2` is the branch that combines:
 
