@@ -23,6 +23,19 @@ This final assignment requires a deeper dive into the subject, pushing you to ap
 
 The final assignment will start in week 3 (February 24th), once all core lectures have been completed, ensuring you have the necessary foundation to work on the project.
 
+## Current Branch Notes
+
+The active experimental branch for the final assignment is `codex/segformer-robust-v2`. The implementation lives in `Final assignment/` and extends the earlier `codex/segformer-robust` branch.
+
+Main changes on `codex/segformer-robust-v2`:
+- Keeps the same SegFormer backbone family and the same MSFE-FPN decoder stack from the earlier robust branch, including `MSFEFPNHead`, `PyramidPoolingModule`, `ScaleAttentionFusion`, and `SyncBatchNorm`.
+- Switches training to an official Cityscapes-style full-resolution pipeline with `1024x2048` base images, random scaling, `1024x1024` class-balanced crops, and default `b5` training with batch size `1`.
+- Uses the Cityscapes `train` split plus most of `val` for training, while reserving a fixed 4-image holdout from `val` for validation.
+- Retains the robustness-focused weather and appearance augmentations, including fog, rain, snow, low-light, domain shift, and synthetic shadow perturbations.
+- Evaluates with multi-scale test-time augmentation using scales `0.75`, `1.0`, and `1.25` with horizontal flip enabled by default.
+- Adds SegFix-style boundary refinement during inference for sharper prediction boundaries.
+- Improves submission robustness by adding configurable prediction settings, automatic device selection, CUDA usability checks, and CUDA OOM fallback profiles that retry with lighter inference settings when needed.
+
 ## Authors and Contact
 
 This course material is developed and maintained by the following contributors:  
