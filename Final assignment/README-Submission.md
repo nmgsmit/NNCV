@@ -90,6 +90,24 @@ docker run --rm `
 Expected behavior:
 - It reads all `*.png` from `/data`
 - It writes predicted masks to `/output` (same filenames)
+- The saved masks are single-channel class-index PNG files, so they usually look dark or grayscale in a normal image viewer even when they are correct.
+- On CUDA, the script now retries with lighter inference profiles if the requested TTA/refinement settings exceed GPU memory.
+
+If you want a lighter local smoke test on a machine without a stable CUDA Docker setup, you can temporarily run:
+
+```powershell
+docker run --rm `
+  -e PREDICT_DEVICE=cpu `
+  -e PREDICT_IMAGE_SIZE=512,1024 `
+  -e PREDICT_TTA_SCALES=1.0 `
+  -e PREDICT_TTA_FLIP=0 `
+  -e PREDICT_USE_SEGFIX=0 `
+  -v "${PWD}\local_data:/data" `
+  -v "${PWD}\local_output:/output" `
+  nncv-submission:latest
+```
+
+The default submission behavior is unchanged; these environment variables are only for local debugging.
 
 ---
 

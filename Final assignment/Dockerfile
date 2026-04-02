@@ -2,6 +2,7 @@ FROM pytorch/pytorch:2.10.0-cuda12.6-cudnn9-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN apt-get update && apt-get install -y \
     python3 \

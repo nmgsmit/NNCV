@@ -2,6 +2,8 @@
 Prediction pipeline for the current experiment branch.
 """
 from contextlib import nullcontext
+from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import numpy as np
@@ -13,14 +15,19 @@ from torchvision.transforms.v2 import Compose, InterpolationMode, Normalize, Res
 from model import Model, infer_model_variant_from_state_dict
 
 
-IMAGE_DIR = "/data"
-OUTPUT_DIR = "/output"
-MODEL_PATH = "/app/model.pt"
-IMAGE_SIZE = (1024, 2048)
+DEFAULT_IMAGE_DIR = Path("/data")
+DEFAULT_OUTPUT_DIR = Path("/output")
+DEFAULT_MODEL_PATH = Path("/app/model.pt")
+DEFAULT_IMAGE_SIZE = (1024, 2048)
 CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
 CITYSCAPES_STD = (0.229, 0.224, 0.225)
-TTA_SCALES = (0.75, 1.0, 1.25)
-TTA_FLIP = True
+DEFAULT_TTA_SCALES = (0.75, 1.0, 1.25)
+DEFAULT_TTA_FLIP = True
+DEFAULT_USE_SEGFIX = True
+FALLBACK_IMAGE_SIZES = (
+    (768, 1536),
+    (512, 1024),
+)
 SEGFIX_RADII = (1, 2, 4)
 SEGFIX_SCORE_MARGIN = 0.05
 SEGFIX_BOUNDARY_DILATION = 1
@@ -36,10 +43,140 @@ SEGFIX_DIRECTIONS = (
 )
 
 
-def preprocess(img: Image.Image) -> torch.Tensor:
+@dataclass(frozen=True)
+class InferenceProfile:
+    name: str
+    image_size: tuple[int, int]
+    tta_scales: tuple[float, ...]
+    tta_flip: bool
+    use_segfix: bool
+
+
+def parse_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(f"Environment variable {name} must be a boolean flag, got '{value}'.")
+
+
+def parse_number_tuple_env(name: str, default: tuple[int, int], cast: type[int] | type[float]) -> tuple[int, ...] | tuple[float, ...]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    try:
+        parsed = tuple(cast(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be a comma-separated list, got '{value}'.") from exc
+
+    if len(parsed) == 0:
+        raise ValueError(f"Environment variable {name} must contain at least one value.")
+    return parsed
+
+
+def get_image_size() -> tuple[int, int]:
+    parsed = parse_number_tuple_env("PREDICT_IMAGE_SIZE", DEFAULT_IMAGE_SIZE, int)
+    if len(parsed) != 2:
+        raise ValueError("PREDICT_IMAGE_SIZE must be formatted as 'height,width'.")
+    height, width = parsed
+    if height <= 0 or width <= 0:
+        raise ValueError("PREDICT_IMAGE_SIZE values must be positive integers.")
+    return height, width
+
+
+def get_tta_scales() -> tuple[float, ...]:
+    parsed = parse_number_tuple_env("PREDICT_TTA_SCALES", DEFAULT_TTA_SCALES, float)
+    if any(scale <= 0 for scale in parsed):
+        raise ValueError("PREDICT_TTA_SCALES must contain positive numbers.")
+    return parsed
+
+
+def build_inference_profiles(
+    image_size: tuple[int, int],
+    tta_scales: tuple[float, ...],
+    tta_flip: bool,
+    use_segfix: bool,
+) -> list[InferenceProfile]:
+    profiles: list[InferenceProfile] = []
+    seen_configs: set[tuple[tuple[int, int], tuple[float, ...], bool, bool]] = set()
+
+    def add_profile(
+        name: str,
+        profile_image_size: tuple[int, int],
+        profile_tta_scales: tuple[float, ...],
+        profile_tta_flip: bool,
+        profile_use_segfix: bool,
+    ) -> None:
+        config = (
+            profile_image_size,
+            profile_tta_scales,
+            profile_tta_flip,
+            profile_use_segfix,
+        )
+        if config in seen_configs:
+            return
+        seen_configs.add(config)
+        profiles.append(
+            InferenceProfile(
+                name=name,
+                image_size=profile_image_size,
+                tta_scales=profile_tta_scales,
+                tta_flip=profile_tta_flip,
+                use_segfix=profile_use_segfix,
+            )
+        )
+
+    add_profile("requested", image_size, tta_scales, tta_flip, use_segfix)
+    add_profile("no-flip", image_size, tta_scales, False, use_segfix)
+    add_profile("single-scale", image_size, (1.0,), False, False)
+
+    for fallback_size in FALLBACK_IMAGE_SIZES:
+        if fallback_size[0] >= image_size[0] or fallback_size[1] >= image_size[1]:
+            continue
+        add_profile(f"single-scale-{fallback_size[0]}x{fallback_size[1]}", fallback_size, (1.0,), False, False)
+
+    return profiles
+
+
+def resolve_device() -> str:
+    requested_device = os.getenv("PREDICT_DEVICE", "auto").strip().lower()
+    if requested_device not in {"auto", "cpu", "cuda"}:
+        raise ValueError("PREDICT_DEVICE must be one of: auto, cpu, cuda.")
+
+    if requested_device == "cpu":
+        return "cpu"
+
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("PREDICT_DEVICE=cuda was requested, but CUDA is not available.")
+        try:
+            torch.zeros(1, device="cuda")
+            return "cuda"
+        except Exception as exc:
+            raise RuntimeError("PREDICT_DEVICE=cuda was requested, but CUDA is not usable.") from exc
+
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    try:
+        torch.zeros(1, device="cuda")
+        return "cuda"
+    except Exception as exc:
+        print(f"CUDA was detected but is not usable ({exc}). Falling back to CPU.")
+        return "cpu"
+
+
+def preprocess(img: Image.Image, image_size: tuple[int, int]) -> torch.Tensor:
     transform = Compose([
         ToImage(),
-        Resize(size=IMAGE_SIZE, interpolation=InterpolationMode.BILINEAR, antialias=True),
+        Resize(size=image_size, interpolation=InterpolationMode.BILINEAR, antialias=True),
         ToDtype(dtype=torch.float32, scale=True),
         Normalize(mean=CITYSCAPES_MEAN, std=CITYSCAPES_STD),
     ])
@@ -58,12 +195,18 @@ def resize_logits(logits: torch.Tensor, target_size: tuple[int, int]) -> torch.T
     return F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
 
 
-def multi_scale_inference(model: Model, image_tensor: torch.Tensor, amp_enabled: bool) -> torch.Tensor:
+def multi_scale_inference(
+    model: Model,
+    image_tensor: torch.Tensor,
+    amp_enabled: bool,
+    tta_scales: tuple[float, ...],
+    tta_flip: bool,
+) -> torch.Tensor:
     target_size = image_tensor.shape[-2:]
     fused_logits = None
     num_predictions = 0
 
-    for scale in TTA_SCALES:
+    for scale in tta_scales:
         if scale == 1.0:
             scaled_images = image_tensor
         else:
@@ -79,7 +222,7 @@ def multi_scale_inference(model: Model, image_tensor: torch.Tensor, amp_enabled:
         fused_logits = logits if fused_logits is None else fused_logits + logits
         num_predictions += 1
 
-        if TTA_FLIP:
+        if tta_flip:
             flipped_images = torch.flip(scaled_images, dims=[3])
             with autocast_context(amp_enabled):
                 flipped_logits = model(flipped_images)
@@ -89,6 +232,13 @@ def multi_scale_inference(model: Model, image_tensor: torch.Tensor, amp_enabled:
             num_predictions += 1
 
     return fused_logits / max(num_predictions, 1)
+
+
+def is_cuda_oom(error: RuntimeError) -> bool:
+    oom_types = (torch.OutOfMemoryError,)
+    if isinstance(error, oom_types):
+        return True
+    return "out of memory" in str(error).lower()
 
 
 def shift_tensor(x: torch.Tensor, dy: int, dx: int, fill_value: int | float) -> torch.Tensor:
@@ -178,36 +328,133 @@ def postprocess(prediction: torch.Tensor) -> np.ndarray:
     return prediction.squeeze(0).cpu().detach().numpy()
 
 
-def main() -> None:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    amp_enabled = torch.cuda.is_available()
+def save_prediction(prediction: np.ndarray, out_path: Path) -> None:
+    prediction_uint8 = np.ascontiguousarray(prediction.astype(np.uint8))
+    Image.fromarray(prediction_uint8, mode="L").save(out_path)
 
-    state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+
+def run_profile(
+    model: Model,
+    img: Image.Image,
+    original_shape: tuple[int, int],
+    device: str,
+    amp_enabled: bool,
+    profile: InferenceProfile,
+) -> np.ndarray:
+    img_tensor = preprocess(img, image_size=profile.image_size).to(device)
+    pred = multi_scale_inference(
+        model,
+        img_tensor,
+        amp_enabled=amp_enabled,
+        tta_scales=profile.tta_scales,
+        tta_flip=profile.tta_flip,
+    )
+    if profile.use_segfix:
+        prediction = segfix_style_refine(pred)
+    else:
+        prediction = pred.argmax(dim=1)
+    return postprocess(resize_prediction(prediction, original_shape))
+
+
+def predict_with_fallback(
+    model: Model,
+    img: Image.Image,
+    original_shape: tuple[int, int],
+    device: str,
+    amp_enabled: bool,
+    profiles: list[InferenceProfile],
+    start_index: int,
+) -> tuple[np.ndarray, int]:
+    for profile_index in range(start_index, len(profiles)):
+        profile = profiles[profile_index]
+        print(
+            f"Trying inference profile '{profile.name}' "
+            f"(image_size={profile.image_size}, scales={profile.tta_scales}, "
+            f"flip={profile.tta_flip}, segfix={profile.use_segfix})."
+        )
+        try:
+            return run_profile(
+                model,
+                img,
+                original_shape=original_shape,
+                device=device,
+                amp_enabled=amp_enabled,
+                profile=profile,
+            ), profile_index
+        except RuntimeError as exc:
+            if device != "cuda" or not is_cuda_oom(exc):
+                raise
+            print(f"CUDA OOM while using profile '{profile.name}'. Retrying with a lighter profile.")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    raise RuntimeError("All inference profiles failed due to CUDA OOM.")
+
+
+def main() -> None:
+    image_dir = Path(os.getenv("IMAGE_DIR", DEFAULT_IMAGE_DIR.as_posix()))
+    output_dir = Path(os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR.as_posix()))
+    model_path = Path(os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH.as_posix()))
+    image_size = get_image_size()
+    tta_scales = get_tta_scales()
+    tta_flip = parse_bool_env("PREDICT_TTA_FLIP", DEFAULT_TTA_FLIP)
+    use_segfix = parse_bool_env("PREDICT_USE_SEGFIX", DEFAULT_USE_SEGFIX)
+
+    device = resolve_device()
+    amp_enabled = device == "cuda"
+
+    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
     model_variant = infer_model_variant_from_state_dict(state_dict)
     print(f"Loaded SegFormer checkpoint as variant '{model_variant}'.")
+    print(f"Running prediction on device='{device}' with requested image_size={image_size}.")
 
     model = Model(variant=model_variant)
     model.load_state_dict(state_dict, strict=True)
     model.eval().to(device)
 
-    image_files = list(Path(IMAGE_DIR).glob("*.png"))
+    image_files = sorted(image_dir.glob("*.png"))
+    profiles = build_inference_profiles(
+        image_size=image_size,
+        tta_scales=tta_scales,
+        tta_flip=tta_flip,
+        use_segfix=use_segfix,
+    )
+    active_profile_index = 0
     print(f"Found {len(image_files)} images to process.")
-    print(f"Using multi-scale TTA with scales={TTA_SCALES} and flip={TTA_FLIP}.")
-    print("Applying SegFix-style boundary refinement after TTA.")
+    print(f"Using multi-scale TTA with scales={tta_scales} and flip={tta_flip}.")
+    print(f"SegFix-style boundary refinement enabled: {use_segfix}.")
+    if device == "cuda":
+        print("CUDA OOM fallback is enabled. The script will retry with lighter inference settings if needed.")
 
-    with torch.no_grad():
-        for img_path in image_files:
-            img = Image.open(img_path).convert("RGB")
-            original_shape = np.array(img).shape[:2]
+    with torch.inference_mode():
+        for index, img_path in enumerate(image_files, start=1):
+            print(f"[{index}/{len(image_files)}] Processing {img_path.name}...")
+            with Image.open(img_path) as img:
+                img = img.convert("RGB")
+                original_shape = (img.height, img.width)
+                seg_pred, used_profile_index = predict_with_fallback(
+                    model,
+                    img,
+                    original_shape=original_shape,
+                    device=device,
+                    amp_enabled=amp_enabled,
+                    profiles=profiles,
+                    start_index=active_profile_index,
+                )
+            if used_profile_index != active_profile_index:
+                active_profile_index = used_profile_index
+                print(f"Switching remaining images to profile '{profiles[active_profile_index].name}'.")
 
-            img_tensor = preprocess(img).to(device)
-            pred = multi_scale_inference(model, img_tensor, amp_enabled=amp_enabled)
-            refined_prediction = segfix_style_refine(pred)
-            seg_pred = postprocess(resize_prediction(refined_prediction, original_shape))
-
-            out_path = Path(OUTPUT_DIR) / img_path.name
+            out_path = output_dir / img_path.name
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            Image.fromarray(seg_pred.astype(np.uint8)).save(out_path)
+            save_prediction(seg_pred, out_path)
+            unique_labels = np.unique(seg_pred)
+            print(
+                f"Saved prediction to {out_path} "
+                f"(shape={seg_pred.shape}, labels={unique_labels.tolist()}, dtype={seg_pred.dtype})."
+            )
+            if device == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
