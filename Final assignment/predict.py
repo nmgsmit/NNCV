@@ -21,13 +21,9 @@ DEFAULT_MODEL_PATH = Path("/app/model.pt")
 DEFAULT_IMAGE_SIZE = (1024, 2048)
 CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
 CITYSCAPES_STD = (0.229, 0.224, 0.225)
-DEFAULT_TTA_SCALES = (0.75, 1.0, 1.25)
-DEFAULT_TTA_FLIP = True
+DEFAULT_TTA_SCALES = (0.75, 1.0)
+DEFAULT_TTA_FLIP = False
 DEFAULT_USE_SEGFIX = True
-FALLBACK_IMAGE_SIZES = (
-    (768, 1536),
-    (512, 1024),
-)
 SEGFIX_RADII = (1, 2, 4)
 SEGFIX_SCORE_MARGIN = 0.05
 SEGFIX_BOUNDARY_DILATION = 1
@@ -96,53 +92,6 @@ def get_tta_scales() -> tuple[float, ...]:
     if any(scale <= 0 for scale in parsed):
         raise ValueError("PREDICT_TTA_SCALES must contain positive numbers.")
     return parsed
-
-
-def build_inference_profiles(
-    image_size: tuple[int, int],
-    tta_scales: tuple[float, ...],
-    tta_flip: bool,
-    use_segfix: bool,
-) -> list[InferenceProfile]:
-    profiles: list[InferenceProfile] = []
-    seen_configs: set[tuple[tuple[int, int], tuple[float, ...], bool, bool]] = set()
-
-    def add_profile(
-        name: str,
-        profile_image_size: tuple[int, int],
-        profile_tta_scales: tuple[float, ...],
-        profile_tta_flip: bool,
-        profile_use_segfix: bool,
-    ) -> None:
-        config = (
-            profile_image_size,
-            profile_tta_scales,
-            profile_tta_flip,
-            profile_use_segfix,
-        )
-        if config in seen_configs:
-            return
-        seen_configs.add(config)
-        profiles.append(
-            InferenceProfile(
-                name=name,
-                image_size=profile_image_size,
-                tta_scales=profile_tta_scales,
-                tta_flip=profile_tta_flip,
-                use_segfix=profile_use_segfix,
-            )
-        )
-
-    add_profile("requested", image_size, tta_scales, tta_flip, use_segfix)
-    add_profile("no-flip", image_size, tta_scales, False, use_segfix)
-    add_profile("single-scale", image_size, (1.0,), False, False)
-
-    for fallback_size in FALLBACK_IMAGE_SIZES:
-        if fallback_size[0] >= image_size[0] or fallback_size[1] >= image_size[1]:
-            continue
-        add_profile(f"single-scale-{fallback_size[0]}x{fallback_size[1]}", fallback_size, (1.0,), False, False)
-
-    return profiles
 
 
 def resolve_device() -> str:
@@ -232,13 +181,6 @@ def multi_scale_inference(
             num_predictions += 1
 
     return fused_logits / max(num_predictions, 1)
-
-
-def is_cuda_oom(error: RuntimeError) -> bool:
-    oom_types = (torch.OutOfMemoryError,)
-    if isinstance(error, oom_types):
-        return True
-    return "out of memory" in str(error).lower()
 
 
 def shift_tensor(x: torch.Tensor, dy: int, dx: int, fill_value: int | float) -> torch.Tensor:
@@ -356,41 +298,6 @@ def run_profile(
     return postprocess(resize_prediction(prediction, original_shape))
 
 
-def predict_with_fallback(
-    model: Model,
-    img: Image.Image,
-    original_shape: tuple[int, int],
-    device: str,
-    amp_enabled: bool,
-    profiles: list[InferenceProfile],
-    start_index: int,
-) -> tuple[np.ndarray, int]:
-    for profile_index in range(start_index, len(profiles)):
-        profile = profiles[profile_index]
-        print(
-            f"Trying inference profile '{profile.name}' "
-            f"(image_size={profile.image_size}, scales={profile.tta_scales}, "
-            f"flip={profile.tta_flip}, segfix={profile.use_segfix})."
-        )
-        try:
-            return run_profile(
-                model,
-                img,
-                original_shape=original_shape,
-                device=device,
-                amp_enabled=amp_enabled,
-                profile=profile,
-            ), profile_index
-        except RuntimeError as exc:
-            if device != "cuda" or not is_cuda_oom(exc):
-                raise
-            print(f"CUDA OOM while using profile '{profile.name}'. Retrying with a lighter profile.")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    raise RuntimeError("All inference profiles failed due to CUDA OOM.")
-
-
 def main() -> None:
     image_dir = Path(os.getenv("IMAGE_DIR", DEFAULT_IMAGE_DIR.as_posix()))
     output_dir = Path(os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR.as_posix()))
@@ -413,18 +320,19 @@ def main() -> None:
     model.eval().to(device)
 
     image_files = sorted(image_dir.glob("*.png"))
-    profiles = build_inference_profiles(
+    profile = InferenceProfile(
+        name="requested",
         image_size=image_size,
         tta_scales=tta_scales,
         tta_flip=tta_flip,
         use_segfix=use_segfix,
     )
-    active_profile_index = 0
     print(f"Found {len(image_files)} images to process.")
-    print(f"Using multi-scale TTA with scales={tta_scales} and flip={tta_flip}.")
-    print(f"SegFix-style boundary refinement enabled: {use_segfix}.")
-    if device == "cuda":
-        print("CUDA OOM fallback is enabled. The script will retry with lighter inference settings if needed.")
+    print(
+        f"Using inference profile '{profile.name}' "
+        f"(image_size={profile.image_size}, scales={profile.tta_scales}, "
+        f"flip={profile.tta_flip}, segfix={profile.use_segfix})."
+    )
 
     with torch.inference_mode():
         for index, img_path in enumerate(image_files, start=1):
@@ -432,18 +340,14 @@ def main() -> None:
             with Image.open(img_path) as img:
                 img = img.convert("RGB")
                 original_shape = (img.height, img.width)
-                seg_pred, used_profile_index = predict_with_fallback(
+                seg_pred = run_profile(
                     model,
                     img,
                     original_shape=original_shape,
                     device=device,
                     amp_enabled=amp_enabled,
-                    profiles=profiles,
-                    start_index=active_profile_index,
+                    profile=profile,
                 )
-            if used_profile_index != active_profile_index:
-                active_profile_index = used_profile_index
-                print(f"Switching remaining images to profile '{profiles[active_profile_index].name}'.")
 
             out_path = output_dir / img_path.name
             out_path.parent.mkdir(parents=True, exist_ok=True)
