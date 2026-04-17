@@ -1,3 +1,4 @@
+import io
 import os
 import random
 from argparse import ArgumentParser
@@ -9,6 +10,7 @@ import torch.nn.functional as F
 import wandb
 from torch.optim import AdamW
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from PIL import Image
 from torchvision.datasets import Cityscapes
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
@@ -37,16 +39,17 @@ POLY_POWER = 0.9
 MIN_LR_RATIO = 1e-3
 HEAD_LR_MULTIPLIER = 10.0
 HFLIP_PROB = 0.5
-COLOR_JITTER = 0.4
-GAUSSIAN_BLUR = 0.0
+COLOR_JITTER = 0.5
 EMA_DECAY = 0.999
 EVAL_SCALES = (0.75, 1.0, 1.25)
 EVAL_FLIP = True
 DROPOUT = 0.1
 LOVASZ_LOSS_WEIGHT = 1.0
-WEATHER_AUG_PROB = 0.6
-DOMAIN_SHIFT_PROB = 0.4
-SHADOW_PROB = 0.25
+WEATHER_AUG_PROB = 0.75
+APPEARANCE_AUG_PROB = 0.7
+CORRUPTION_AUG_PROB = 0.55
+OCCLUSION_AUG_PROB = 0.25
+EXTRA_CORRUPTION_PROB = 0.3
 HOLDOUT_FILENAMES = (
     "tubingen_000047_000019_leftImg8bit.png",
     "tubingen_000063_000019_leftImg8bit.png",
@@ -271,17 +274,48 @@ def compute_mean_dice(confusion_matrix: torch.Tensor) -> float:
 
 
 class RobustnessAugmentor:
+    def __init__(self) -> None:
+        self.weather_effects = (
+            self.apply_fog,
+            self.apply_rain,
+            self.apply_snow,
+            self.apply_low_light,
+        )
+        self.appearance_effects = (
+            self.apply_domain_shift,
+            self.apply_color_cast,
+            self.apply_shadow,
+            self.apply_vignette,
+        )
+        self.corruption_effects = (
+            self.apply_gaussian_blur,
+            self.apply_motion_blur,
+            self.apply_jpeg_compression,
+            self.apply_sun_glare,
+        )
+        self.extra_effects = (
+            self.apply_gaussian_blur,
+            self.apply_motion_blur,
+            self.apply_jpeg_compression,
+            self.apply_color_cast,
+            self.apply_vignette,
+        )
+
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
         if random.random() < WEATHER_AUG_PROB:
-            image = random.choice(
-                [self.apply_fog, self.apply_rain, self.apply_snow, self.apply_low_light]
-            )(image)
+            image = random.choice(self.weather_effects)(image)
 
-        if random.random() < DOMAIN_SHIFT_PROB:
-            image = self.apply_domain_shift(image)
+        if random.random() < APPEARANCE_AUG_PROB:
+            image = random.choice(self.appearance_effects)(image)
 
-        if random.random() < SHADOW_PROB:
-            image = self.apply_shadow(image)
+        if random.random() < CORRUPTION_AUG_PROB:
+            image = random.choice(self.corruption_effects)(image)
+
+        if random.random() < OCCLUSION_AUG_PROB:
+            image = self.apply_occlusion(image)
+
+        if random.random() < EXTRA_CORRUPTION_PROB:
+            image = random.choice(self.extra_effects)(image)
 
         return image.clamp(0.0, 1.0)
 
@@ -289,76 +323,178 @@ class RobustnessAugmentor:
         height, width = image.shape[-2:]
         coarse_height = max(2, height // scale)
         coarse_width = max(2, width // scale)
-        noise = torch.rand((1, 1, coarse_height, coarse_width), dtype=image.dtype)
+        noise = torch.rand((1, 1, coarse_height, coarse_width), dtype=image.dtype, device=image.device)
         noise = F.interpolate(noise, size=(height, width), mode="bilinear", align_corners=False)
         noise = F.avg_pool2d(noise, kernel_size=5, stride=1, padding=2)
         return noise.squeeze(0)
 
     def apply_fog(self, image: torch.Tensor) -> torch.Tensor:
         haze = self.smooth_noise(image, scale=20)
-        strength = random.uniform(0.2, 0.45)
-        fog = 0.75 + 0.25 * haze
+        strength = random.uniform(0.28, 0.55)
+        fog = 0.72 + 0.28 * haze
         image = image * (1.0 - strength) + fog.expand_as(image) * strength
-        image = TF.adjust_contrast(image, random.uniform(0.6, 0.85))
+        image = TF.adjust_contrast(image, random.uniform(0.5, 0.8))
         return image
 
     def apply_low_light(self, image: torch.Tensor) -> torch.Tensor:
-        gamma = random.uniform(1.4, 2.4)
-        brightness = random.uniform(0.35, 0.7)
-        sensor_noise = torch.randn_like(image) * random.uniform(0.01, 0.03)
+        gamma = random.uniform(1.6, 2.8)
+        brightness = random.uniform(0.25, 0.6)
+        sensor_noise = torch.randn_like(image) * random.uniform(0.015, 0.04)
         image = TF.adjust_gamma(image, gamma=gamma)
         image = image * brightness + sensor_noise
         return image
 
     def apply_rain(self, image: torch.Tensor) -> torch.Tensor:
         height, width = image.shape[-2:]
-        rain_mask = (torch.rand((1, 1, height, width), dtype=image.dtype) > 0.992).float()
-        kernel = torch.zeros((1, 1, 9, 9), dtype=image.dtype)
+        rain_mask = (torch.rand((1, 1, height, width), dtype=image.dtype, device=image.device) > 0.989).float()
+        kernel = torch.zeros((1, 1, 11, 11), dtype=image.dtype, device=image.device)
         if random.random() < 0.5:
-            for index in range(9):
+            for index in range(11):
                 kernel[0, 0, index, index] = 1.0
         else:
-            for index in range(9):
-                kernel[0, 0, index, 8 - index] = 1.0
+            for index in range(11):
+                kernel[0, 0, index, 10 - index] = 1.0
 
-        streaks = F.conv2d(rain_mask, kernel / kernel.sum(), padding=4)
-        streaks = F.avg_pool2d(streaks, kernel_size=3, stride=1, padding=1).squeeze(0)
-        strength = random.uniform(0.15, 0.3)
-        image = TF.adjust_brightness(image, random.uniform(0.75, 0.95))
-        image = TF.adjust_contrast(image, random.uniform(0.7, 0.9))
+        streaks = F.conv2d(rain_mask, kernel / kernel.sum(), padding=5)
+        streaks = F.avg_pool2d(streaks, kernel_size=5, stride=1, padding=2).squeeze(0)
+        strength = random.uniform(0.2, 0.38)
+        image = TF.adjust_brightness(image, random.uniform(0.65, 0.9))
+        image = TF.adjust_contrast(image, random.uniform(0.6, 0.85))
+        image = image * random.uniform(0.92, 0.98) + random.uniform(0.02, 0.06)
         image = image + streaks.expand_as(image) * strength
         return image
 
     def apply_snow(self, image: torch.Tensor) -> torch.Tensor:
         snow = self.smooth_noise(image, scale=10)
-        snow = (snow > snow.mean() + 0.35 * snow.std()).float()
-        snow = F.avg_pool2d(snow.unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0)
-        haze_strength = random.uniform(0.05, 0.15)
-        snow_strength = random.uniform(0.15, 0.3)
-        image = TF.adjust_saturation(image, random.uniform(0.7, 0.95))
+        snow = (snow > snow.mean() + 0.2 * snow.std()).float()
+        snow = F.avg_pool2d(snow.unsqueeze(0), kernel_size=5, stride=1, padding=2).squeeze(0)
+        haze_strength = random.uniform(0.08, 0.2)
+        snow_strength = random.uniform(0.18, 0.35)
+        image = TF.adjust_saturation(image, random.uniform(0.6, 0.9))
         image = image * (1.0 - haze_strength) + haze_strength
         image = image + snow.expand_as(image) * snow_strength
         return image
 
     def apply_domain_shift(self, image: torch.Tensor) -> torch.Tensor:
-        channel_gain = torch.empty((image.shape[0], 1, 1), dtype=image.dtype).uniform_(0.8, 1.2)
-        channel_bias = torch.empty((image.shape[0], 1, 1), dtype=image.dtype).uniform_(-0.08, 0.08)
+        channel_gain = torch.empty((image.shape[0], 1, 1), dtype=image.dtype, device=image.device).uniform_(0.7, 1.3)
+        channel_bias = torch.empty((image.shape[0], 1, 1), dtype=image.dtype, device=image.device).uniform_(-0.12, 0.12)
         image = image * channel_gain + channel_bias
-        image = TF.adjust_contrast(image, random.uniform(0.7, 1.35))
-        image = TF.adjust_saturation(image, random.uniform(0.6, 1.4))
-        image = TF.adjust_hue(image, random.uniform(-0.08, 0.08))
+        image = TF.adjust_contrast(image, random.uniform(0.65, 1.45))
+        image = TF.adjust_saturation(image, random.uniform(0.55, 1.5))
+        image = TF.adjust_hue(image, random.uniform(-0.12, 0.12))
+        return image
+
+    def apply_color_cast(self, image: torch.Tensor) -> torch.Tensor:
+        tint_choices = (
+            (1.2, 1.05, 0.8),
+            (0.85, 0.98, 1.2),
+            (1.15, 0.95, 0.92),
+            (0.92, 1.08, 1.15),
+        )
+        base_tint = torch.tensor(random.choice(tint_choices), dtype=image.dtype, device=image.device).view(3, 1, 1)
+        tint_jitter = torch.empty((3, 1, 1), dtype=image.dtype, device=image.device).uniform_(0.94, 1.06)
+        strength = random.uniform(0.25, 0.5)
+        tint = 1.0 + (base_tint * tint_jitter - 1.0) * strength
+        image = image * tint
+        image = TF.adjust_saturation(image, random.uniform(0.85, 1.25))
         return image
 
     def apply_shadow(self, image: torch.Tensor) -> torch.Tensor:
         height, width = image.shape[-2:]
-        y_coords = torch.linspace(0.0, 1.0, steps=height, dtype=image.dtype).view(1, height, 1)
-        x_coords = torch.linspace(0.0, 1.0, steps=width, dtype=image.dtype).view(1, 1, width)
-        mask = y_coords.expand(1, height, width) if random.random() < 0.5 else x_coords.expand(1, height, width)
+        y_coords = torch.linspace(0.0, 1.0, steps=height, dtype=image.dtype, device=image.device).view(1, height, 1)
+        x_coords = torch.linspace(0.0, 1.0, steps=width, dtype=image.dtype, device=image.device).view(1, 1, width)
+        if random.random() < 0.5:
+            mask = y_coords.expand(1, height, width)
+        else:
+            mask = x_coords.expand(1, height, width)
+        if random.random() < 0.5:
+            diagonal = (x_coords + y_coords).expand(1, height, width) / 2.0
+            mask = 0.5 * mask + 0.5 * diagonal
         if random.random() < 0.5:
             mask = 1.0 - mask
-        shadow_strength = random.uniform(0.2, 0.45)
+        shadow_strength = random.uniform(0.35, 0.65)
         shadow = 1.0 - shadow_strength * mask
         return image * shadow
+
+    def apply_vignette(self, image: torch.Tensor) -> torch.Tensor:
+        height, width = image.shape[-2:]
+        center_x = random.uniform(-0.15, 0.15)
+        center_y = random.uniform(-0.15, 0.15)
+        y_coords = torch.linspace(-1.0, 1.0, steps=height, dtype=image.dtype, device=image.device).view(1, height, 1)
+        x_coords = torch.linspace(-1.0, 1.0, steps=width, dtype=image.dtype, device=image.device).view(1, 1, width)
+        radius = torch.sqrt((x_coords - center_x) ** 2 + (y_coords - center_y) ** 2).clamp(0.0, 1.5)
+        strength = random.uniform(0.25, 0.55)
+        falloff = random.uniform(1.6, 2.4)
+        vignette = (1.0 - strength * radius.pow(falloff)).clamp(0.45, 1.0)
+        return image * vignette
+
+    def apply_gaussian_blur(self, image: torch.Tensor) -> torch.Tensor:
+        kernel_size = random.choice((5, 7, 9))
+        sigma = random.uniform(1.0, 2.8)
+        return F_v2.gaussian_blur(image, kernel_size=[kernel_size, kernel_size], sigma=[sigma, sigma])
+
+    def apply_motion_blur(self, image: torch.Tensor) -> torch.Tensor:
+        kernel_size = random.choice((7, 9, 11, 13))
+        kernel_2d = torch.zeros((kernel_size, kernel_size), dtype=image.dtype, device=image.device)
+        direction = random.choice(("horizontal", "vertical", "diag", "anti_diag"))
+        if direction == "horizontal":
+            kernel_2d[kernel_size // 2, :] = 1.0
+        elif direction == "vertical":
+            kernel_2d[:, kernel_size // 2] = 1.0
+        elif direction == "diag":
+            for index in range(kernel_size):
+                kernel_2d[index, index] = 1.0
+        else:
+            for index in range(kernel_size):
+                kernel_2d[index, kernel_size - 1 - index] = 1.0
+
+        kernel = (kernel_2d / kernel_2d.sum()).view(1, 1, kernel_size, kernel_size)
+        kernel = kernel.expand(image.shape[0], 1, kernel_size, kernel_size)
+        blurred = F.conv2d(image.unsqueeze(0), kernel, padding=kernel_size // 2, groups=image.shape[0]).squeeze(0)
+        return TF.adjust_contrast(blurred, random.uniform(0.8, 0.95))
+
+    def apply_jpeg_compression(self, image: torch.Tensor) -> torch.Tensor:
+        quality = random.randint(10, 35)
+        buffer = io.BytesIO()
+        pil_image = TF.to_pil_image(image.clamp(0.0, 1.0).cpu())
+        pil_image.save(buffer, format="JPEG", quality=quality, optimize=False)
+        buffer.seek(0)
+        with Image.open(buffer) as compressed_image:
+            compressed = compressed_image.convert("RGB")
+            tensor = TF.pil_to_tensor(compressed).to(dtype=image.dtype, device=image.device) / 255.0
+        return tensor
+
+    def apply_sun_glare(self, image: torch.Tensor) -> torch.Tensor:
+        height, width = image.shape[-2:]
+        center_x = random.uniform(0.15, 0.85)
+        center_y = random.uniform(0.05, 0.4)
+        sigma = random.uniform(0.08, 0.22)
+        y_coords = torch.linspace(0.0, 1.0, steps=height, dtype=image.dtype, device=image.device).view(1, height, 1)
+        x_coords = torch.linspace(0.0, 1.0, steps=width, dtype=image.dtype, device=image.device).view(1, 1, width)
+        radius = torch.sqrt((x_coords - center_x) ** 2 + (y_coords - center_y) ** 2)
+        flare_core = torch.exp(-(radius ** 2) / max(2.0 * sigma ** 2, 1e-6))
+        flare_streak = torch.exp(-torch.abs(y_coords - center_y) / random.uniform(0.015, 0.04))
+        flare_streak = flare_streak * torch.exp(-torch.abs(x_coords - center_x) / random.uniform(0.15, 0.35))
+        flare = (flare_core + 0.35 * flare_streak).clamp(0.0, 1.0)
+        warm_tint = torch.tensor((1.0, 0.92, 0.76), dtype=image.dtype, device=image.device).view(3, 1, 1)
+        strength = random.uniform(0.3, 0.6)
+        image = image * (1.0 - flare * strength * 0.35)
+        image = image + warm_tint * flare * strength
+        image = TF.adjust_contrast(image, random.uniform(0.75, 0.95))
+        return image
+
+    def apply_occlusion(self, image: torch.Tensor) -> torch.Tensor:
+        occluded = image.clone()
+        height, width = image.shape[-2:]
+        num_patches = random.randint(1, 3)
+        for _ in range(num_patches):
+            patch_height = random.randint(max(8, height // 12), max(12, height // 5))
+            patch_width = random.randint(max(8, width // 16), max(12, width // 6))
+            top = random.randint(0, max(height - patch_height, 0))
+            left = random.randint(0, max(width - patch_width, 0))
+            fill = torch.empty((image.shape[0], 1, 1), dtype=image.dtype, device=image.device).uniform_(0.0, 0.4)
+            occluded[:, top:top + patch_height, left:left + patch_width] = fill
+        return occluded
 
 
 class CityscapesJointTransform:
@@ -426,8 +562,6 @@ class CityscapesJointTransform:
         image = ToDtype(torch.float32, scale=True)(image)
         image = self.color_jitter(image)
         image = self.robustness_augmentor(image)
-        if GAUSSIAN_BLUR > 0.0 and random.random() < GAUSSIAN_BLUR:
-            image = F_v2.gaussian_blur(image, kernel_size=3)
 
         image = Normalize(CITYSCAPES_MEAN, CITYSCAPES_STD)(image)
         target = ToDtype(torch.int64)(ToImage()(target))
@@ -564,8 +698,16 @@ def main(args) -> None:
             "min_lr_ratio": MIN_LR_RATIO,
             "lovasz_loss_weight": LOVASZ_LOSS_WEIGHT,
             "weather_aug_prob": WEATHER_AUG_PROB,
-            "domain_shift_prob": DOMAIN_SHIFT_PROB,
-            "shadow_prob": SHADOW_PROB,
+            "appearance_aug_prob": APPEARANCE_AUG_PROB,
+            "corruption_aug_prob": CORRUPTION_AUG_PROB,
+            "occlusion_aug_prob": OCCLUSION_AUG_PROB,
+            "extra_corruption_prob": EXTRA_CORRUPTION_PROB,
+            "augmentation_groups": {
+                "weather": ["fog", "rain", "snow", "low_light"],
+                "appearance": ["domain_shift", "color_cast", "shadow", "vignette"],
+                "corruptions": ["gaussian_blur", "motion_blur", "jpeg_compression", "sun_glare"],
+                "occlusion": ["cutout"],
+            },
             "ema_decay": EMA_DECAY,
             "eval_scales": EVAL_SCALES,
             "eval_flip": EVAL_FLIP,

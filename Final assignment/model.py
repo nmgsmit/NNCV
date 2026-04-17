@@ -6,11 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-MODEL_NAME = "segformer-robust-v2"
+MODEL_NAME = "segformer-robust-v3"
 MODEL_DESCRIPTION = (
-    "Robust SegFormer v2 built on the MSFE-FPN decoder with SyncBN, combining the "
-    "official Cityscapes-style full-resolution training pipeline, robust weather and "
-    "appearance augmentations, and stronger TTA plus SegFix-style inference refinement."
+    "Robust SegFormer v3 keeps the MSFE-FPN decoder with SyncBN and the strong v2 "
+    "training and inference setup, but upgrades the augmentation policy with heavier "
+    "weather, appearance, blur, compression, glare, vignette, and occlusion corruptions."
 )
 LAYER_NORM_EPS = 1e-6
 
