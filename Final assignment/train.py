@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch.optim import AdamW
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 from torchvision.datasets import Cityscapes
 from torchvision.transforms import InterpolationMode
@@ -20,6 +20,7 @@ from torchvision.transforms.v2 import functional as F_v2
 from torchvision.utils import make_grid
 
 from model import MODEL_DESCRIPTION, MODEL_NAME, MODEL_VARIANTS, Model
+from predict import segfix_style_refine
 
 
 IGNORE_INDEX = 255
@@ -41,8 +42,9 @@ HEAD_LR_MULTIPLIER = 10.0
 HFLIP_PROB = 0.5
 COLOR_JITTER = 0.5
 EMA_DECAY = 0.999
-EVAL_SCALES = (0.75, 1.0, 1.25)
-EVAL_FLIP = True
+EVAL_SCALES = (0.75, 1.0)
+EVAL_FLIP = False
+EVAL_USE_SEGFIX = True
 DROPOUT = 0.1
 LOVASZ_LOSS_WEIGHT = 1.0
 WEATHER_AUG_PROB = 0.75
@@ -50,12 +52,6 @@ APPEARANCE_AUG_PROB = 0.7
 CORRUPTION_AUG_PROB = 0.55
 OCCLUSION_AUG_PROB = 0.25
 EXTRA_CORRUPTION_PROB = 0.3
-HOLDOUT_FILENAMES = (
-    "tubingen_000047_000019_leftImg8bit.png",
-    "tubingen_000063_000019_leftImg8bit.png",
-    "tubingen_000126_000019_leftImg8bit.png",
-    "tubingen_000138_000019_leftImg8bit.png",
-)
 
 
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -239,6 +235,23 @@ def update_confusion_matrix(
     ignore_index: int = IGNORE_INDEX,
 ) -> None:
     prediction = logits.argmax(dim=1)
+    valid = target != ignore_index
+    if not valid.any():
+        return
+
+    target = target[valid]
+    prediction = prediction[valid]
+    indices = target * num_classes + prediction
+    confusion_matrix += torch.bincount(indices, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+
+def update_confusion_matrix_from_prediction(
+    confusion_matrix: torch.Tensor,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    ignore_index: int = IGNORE_INDEX,
+) -> None:
     valid = target != ignore_index
     if not valid.any():
         return
@@ -574,28 +587,9 @@ class CityscapesSegmentationDataset(Dataset):
         root: str,
         split: str,
         transform: CityscapesJointTransform,
-        include_filenames: set[str] | None = None,
-        exclude_filenames: set[str] | None = None,
     ):
         self.dataset = Cityscapes(root, split=split, mode="fine", target_type="semantic")
         self.transform = transform
-        self.image_paths = list(self.dataset.images)
-        self.target_paths = [target[0] for target in self.dataset.targets]
-
-        if include_filenames is not None or exclude_filenames is not None:
-            filtered_indices = []
-            for index, image_path in enumerate(self.image_paths):
-                filename = os.path.basename(image_path)
-                if include_filenames is not None and filename not in include_filenames:
-                    continue
-                if exclude_filenames is not None and filename in exclude_filenames:
-                    continue
-                filtered_indices.append(index)
-
-            self.dataset.images = [self.dataset.images[index] for index in filtered_indices]
-            self.dataset.targets = [self.dataset.targets[index] for index in filtered_indices]
-            self.image_paths = [self.image_paths[index] for index in filtered_indices]
-            self.target_paths = [self.target_paths[index] for index in filtered_indices]
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -603,9 +597,6 @@ class CityscapesSegmentationDataset(Dataset):
     def __getitem__(self, index: int):
         image, target = self.dataset[index]
         return self.transform(image, target)
-
-    def filenames(self) -> list[str]:
-        return [os.path.basename(path) for path in self.image_paths]
 
 
 def multi_scale_inference(
@@ -711,37 +702,21 @@ def main(args) -> None:
             "ema_decay": EMA_DECAY,
             "eval_scales": EVAL_SCALES,
             "eval_flip": EVAL_FLIP,
+            "eval_use_segfix": EVAL_USE_SEGFIX,
             "dropout": DROPOUT,
             "batch_size": args.batch_size,
             "num_workers": args.num_workers,
             "seed": args.seed,
             "amp": amp_enabled,
-            "holdout_filenames": HOLDOUT_FILENAMES,
+            "train_split": "train",
+            "valid_split": "val",
         },
     )
 
     train_transform = CityscapesJointTransform(training=True)
     valid_transform = CityscapesJointTransform(training=False)
-    holdout_filenames = set(HOLDOUT_FILENAMES)
-    base_train_dataset = CityscapesSegmentationDataset(args.data_dir, split="train", transform=train_transform)
-    extra_train_dataset = CityscapesSegmentationDataset(
-        args.data_dir,
-        split="val",
-        transform=train_transform,
-        exclude_filenames=holdout_filenames,
-    )
-    valid_dataset = CityscapesSegmentationDataset(
-        args.data_dir,
-        split="val",
-        transform=valid_transform,
-        include_filenames=holdout_filenames,
-    )
-    train_dataset = ConcatDataset([base_train_dataset, extra_train_dataset])
-
-    missing_holdouts = sorted(holdout_filenames - set(valid_dataset.filenames()))
-    if missing_holdouts:
-        missing = ", ".join(missing_holdouts)
-        raise RuntimeError(f"Could not find all fixed holdout validation images in the Cityscapes val split: {missing}")
+    train_dataset = CityscapesSegmentationDataset(args.data_dir, split="train", transform=train_transform)
+    valid_dataset = CityscapesSegmentationDataset(args.data_dir, split="val", transform=valid_transform)
 
     persistent_workers = args.num_workers > 0
     train_dataloader = DataLoader(
@@ -801,14 +776,19 @@ def main(args) -> None:
     )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
+    best_valid_loss = float("inf")
+    best_miou = -float("inf")
+    best_dice = -float("inf")
+    best_epoch = -1
+    best_model_path = None
     global_step = 0
     total_iters = MAX_EPOCHS * max(len(train_dataloader), 1)
 
     print(f"Training {MODEL_NAME} ({args.model_variant})")
     print(MODEL_DESCRIPTION)
     print(f"Pretrained MiT loaded: {pretrained_loaded}")
-    print(f"Training on {len(train_dataset)} images: {len(base_train_dataset)} from train + {len(extra_train_dataset)} from val.")
-    print(f"Using {len(valid_dataset)} fixed holdout validation images: {', '.join(valid_dataset.filenames())}")
+    print(f"Training on {len(train_dataset)} train images.")
+    print(f"Validating on {len(valid_dataset)} val images.")
 
     for epoch in range(MAX_EPOCHS):
         print(f"Epoch {epoch + 1:04}/{MAX_EPOCHS:04}")
@@ -875,10 +855,8 @@ def main(args) -> None:
             valid_ce_losses = []
             valid_lovasz_losses = []
             confusion_matrix = torch.zeros((NUM_CLASSES, NUM_CLASSES), dtype=torch.int64, device=device)
-            preview_predictions = []
-            preview_labels = []
 
-            for images, labels in valid_dataloader:
+            for batch_index, (images, labels) in enumerate(valid_dataloader):
                 labels = convert_to_train_id(labels)
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True).long().squeeze(1)
@@ -896,29 +874,33 @@ def main(args) -> None:
                 valid_losses.append(loss.item())
                 valid_ce_losses.append(ce_loss.item())
                 valid_lovasz_losses.append(lovasz_loss.item())
-                update_confusion_matrix(confusion_matrix, outputs, labels, num_classes=NUM_CLASSES)
-
-                predictions = outputs.softmax(1).argmax(1, keepdim=True)
-                labels_vis = labels.unsqueeze(1)
-
-                preview_predictions.append(convert_train_id_to_color(predictions.cpu()))
-                preview_labels.append(convert_train_id_to_color(labels_vis.cpu()))
-
-            if preview_predictions:
-                predictions = torch.cat(preview_predictions, dim=0)
-                labels_vis = torch.cat(preview_labels, dim=0)
-                grid_columns = min(2, predictions.shape[0])
-
-                predictions_img = make_grid(predictions, nrow=grid_columns).permute(1, 2, 0).numpy()
-                labels_img = make_grid(labels_vis, nrow=grid_columns).permute(1, 2, 0).numpy()
-
-                wandb.log(
-                    {
-                        "predictions": [wandb.Image(predictions_img, caption="Fixed holdout predictions")],
-                        "labels": [wandb.Image(labels_img, caption="Fixed holdout labels")],
-                    },
-                    step=max(global_step - 1, 0),
+                if EVAL_USE_SEGFIX:
+                    metric_prediction = segfix_style_refine(outputs)
+                else:
+                    metric_prediction = outputs.softmax(1).argmax(1)
+                update_confusion_matrix_from_prediction(
+                    confusion_matrix,
+                    metric_prediction,
+                    labels,
+                    num_classes=NUM_CLASSES,
                 )
+
+                if batch_index == 0:
+                    predictions = metric_prediction.unsqueeze(1)
+                    labels_vis = labels.unsqueeze(1)
+
+                    predictions = convert_train_id_to_color(predictions.cpu())
+                    labels_vis = convert_train_id_to_color(labels_vis.cpu())
+                    predictions_img = make_grid(predictions, nrow=1).permute(1, 2, 0).numpy()
+                    labels_img = make_grid(labels_vis, nrow=1).permute(1, 2, 0).numpy()
+
+                    wandb.log(
+                        {
+                            "predictions": [wandb.Image(predictions_img, caption="Validation predictions")],
+                            "labels": [wandb.Image(labels_img, caption="Validation labels")],
+                        },
+                        step=max(global_step - 1, 0),
+                    )
 
             train_loss = sum(train_losses) / max(len(train_losses), 1)
             train_ce_loss = sum(train_ce_losses) / max(len(train_ce_losses), 1)
@@ -928,6 +910,22 @@ def main(args) -> None:
             valid_lovasz_loss = sum(valid_lovasz_losses) / max(len(valid_lovasz_losses), 1)
             valid_miou = compute_mean_iou(confusion_matrix)
             valid_mean_dice = compute_mean_dice(confusion_matrix)
+            if valid_mean_dice > best_dice:
+                best_dice = valid_mean_dice
+                best_miou = valid_miou
+                best_valid_loss = valid_loss
+                best_epoch = epoch
+                if best_model_path and os.path.exists(best_model_path):
+                    os.remove(best_model_path)
+                best_model_path = os.path.join(
+                    output_dir,
+                    f"best_model-epoch={epoch:04}-dice={valid_mean_dice:.4f}-miou={valid_miou:.4f}-val_loss={valid_loss:.4f}.pt",
+                )
+                torch.save(ema_model.state_dict(), best_model_path)
+                print(
+                    f"New best model at epoch {epoch + 1}: "
+                    f"dice={valid_mean_dice:.4f}, miou={valid_miou:.4f}, val_loss={valid_loss:.4f}"
+                )
 
             wandb.log(
                 {
@@ -940,11 +938,20 @@ def main(args) -> None:
                     "valid_lovasz_loss": valid_lovasz_loss,
                     "valid_miou": valid_miou,
                     "valid_mean_dice": valid_mean_dice,
+                    "best_valid_loss": best_valid_loss,
+                    "best_valid_miou": best_miou,
+                    "best_valid_mean_dice": best_dice,
+                    "best_epoch": best_epoch + 1 if best_epoch >= 0 else None,
                 },
                 step=max(global_step - 1, 0),
             )
 
     print("Training complete!")
+    if best_model_path is not None:
+        print(
+            f"Best validation checkpoint: {best_model_path} "
+            f"(epoch={best_epoch + 1}, dice={best_dice:.4f}, miou={best_miou:.4f}, val_loss={best_valid_loss:.4f})"
+        )
 
     final_model_path = os.path.join(
         output_dir,

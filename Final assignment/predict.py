@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms.v2 import Compose, InterpolationMode, Normalize, Resize, ToDtype, ToImage
 
-from model import Model, infer_model_variant_from_state_dict
+from model import MODEL_DESCRIPTION, MODEL_NAME, Model, infer_model_variant_from_state_dict
 
 
 DEFAULT_IMAGE_DIR = Path("/data")
@@ -303,15 +303,17 @@ def main() -> None:
     output_dir = Path(os.getenv("OUTPUT_DIR", DEFAULT_OUTPUT_DIR.as_posix()))
     model_path = Path(os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH.as_posix()))
     image_size = get_image_size()
-    tta_scales = get_tta_scales()
-    tta_flip = parse_bool_env("PREDICT_TTA_FLIP", DEFAULT_TTA_FLIP)
-    use_segfix = parse_bool_env("PREDICT_USE_SEGFIX", DEFAULT_USE_SEGFIX)
+    tta_scales = DEFAULT_TTA_SCALES
+    tta_flip = DEFAULT_TTA_FLIP
+    use_segfix = DEFAULT_USE_SEGFIX
 
     device = resolve_device()
     amp_enabled = device == "cuda"
 
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
     model_variant = infer_model_variant_from_state_dict(state_dict)
+    print(f"Submission model: {MODEL_NAME}")
+    print(f"Submission description: {MODEL_DESCRIPTION}")
     print(f"Loaded SegFormer checkpoint as variant '{model_variant}'.")
     print(f"Running prediction on device='{device}' with requested image_size={image_size}.")
 
@@ -321,7 +323,7 @@ def main() -> None:
 
     image_files = sorted(image_dir.glob("*.png"))
     profile = InferenceProfile(
-        name="requested",
+        name="segformer-robust-v3",
         image_size=image_size,
         tta_scales=tta_scales,
         tta_flip=tta_flip,
