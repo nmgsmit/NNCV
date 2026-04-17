@@ -20,9 +20,6 @@ from torchvision.transforms.v2 import functional as F_v2
 from torchvision.utils import make_grid
 
 from model import MODEL_DESCRIPTION, MODEL_NAME, MODEL_VARIANTS, Model
-from predict import segfix_style_refine
-
-
 IGNORE_INDEX = 255
 NUM_CLASSES = 19
 CITYSCAPES_MEAN = (0.485, 0.456, 0.406)
@@ -42,9 +39,9 @@ HEAD_LR_MULTIPLIER = 10.0
 HFLIP_PROB = 0.5
 COLOR_JITTER = 0.5
 EMA_DECAY = 0.999
-EVAL_SCALES = (0.75, 1.0)
+EVAL_SCALES = (1.0,)
 EVAL_FLIP = False
-EVAL_USE_SEGFIX = True
+EVAL_USE_SEGFIX = False
 DROPOUT = 0.1
 LOVASZ_LOSS_WEIGHT = 1.0
 WEATHER_AUG_PROB = 0.75
@@ -303,12 +300,10 @@ class RobustnessAugmentor:
         self.corruption_effects = (
             self.apply_gaussian_blur,
             self.apply_motion_blur,
-            self.apply_jpeg_compression,
         )
         self.extra_effects = (
             self.apply_gaussian_blur,
             self.apply_motion_blur,
-            self.apply_jpeg_compression,
         )
 
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
@@ -693,7 +688,7 @@ def main(args) -> None:
             "augmentation_groups": {
                 "weather": ["fog", "rain", "snow", "low_light"],
                 "appearance": ["domain_shift", "color_cast", "shadow", "vignette"],
-                "corruptions": ["gaussian_blur", "motion_blur", "jpeg_compression"],
+                "corruptions": ["gaussian_blur", "motion_blur"],
                 "occlusion": ["cutout"],
             },
             "ema_decay": EMA_DECAY,
@@ -858,23 +853,16 @@ def main(args) -> None:
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True).long().squeeze(1)
 
-                outputs = multi_scale_inference(
-                    eval_model,
-                    images,
-                    scales=EVAL_SCALES,
-                    flip=EVAL_FLIP,
-                    amp_enabled=amp_enabled,
-                )
+                with autocast_context(amp_enabled):
+                    outputs = eval_model(images)
+                    outputs = resize_logits(outputs, labels.shape[-2:])
                 ce_loss = ce_criterion(outputs, labels)
                 lovasz_loss = lovasz_softmax_loss(outputs.float(), labels)
                 loss = ce_loss + LOVASZ_LOSS_WEIGHT * lovasz_loss
                 valid_losses.append(loss.item())
                 valid_ce_losses.append(ce_loss.item())
                 valid_lovasz_losses.append(lovasz_loss.item())
-                if EVAL_USE_SEGFIX:
-                    metric_prediction = segfix_style_refine(outputs)
-                else:
-                    metric_prediction = outputs.softmax(1).argmax(1)
+                metric_prediction = outputs.softmax(1).argmax(1)
                 update_confusion_matrix_from_prediction(
                     confusion_matrix,
                     metric_prediction,
