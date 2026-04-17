@@ -3,6 +3,7 @@ import os
 import random
 from argparse import ArgumentParser
 from contextlib import nullcontext
+from multiprocessing import Manager
 
 import torch
 import torch.nn as nn
@@ -29,7 +30,7 @@ TRAIN_CROP_SIZE = (1024, 1024)
 TRAIN_RATIO_RANGE = (0.5, 2.0)
 TRAIN_CAT_MAX_RATIO = 0.75
 DEFAULT_BATCH_SIZE = 1
-MAX_EPOCHS = 30
+MAX_EPOCHS = 60
 BASE_LR = 6e-5
 WEIGHT_DECAY = 1e-2
 WARMUP_ITERS = 1500
@@ -44,6 +45,7 @@ EVAL_FLIP = False
 EVAL_USE_SEGFIX = False
 DROPOUT = 0.1
 LOVASZ_LOSS_WEIGHT = 1.0
+AUGMENTATION_RAMP_EPOCHS = 5
 WEATHER_AUG_PROB = 0.6
 APPEARANCE_AUG_PROB = 0.5
 CORRUPTION_AUG_PROB = 0.05
@@ -306,20 +308,24 @@ class RobustnessAugmentor:
             self.apply_motion_blur,
         )
 
-    def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        if random.random() < WEATHER_AUG_PROB:
+    def __call__(self, image: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
+        strength = float(max(0.0, min(strength, 1.0)))
+        if strength <= 0.0:
+            return image
+
+        if random.random() < WEATHER_AUG_PROB * strength:
             image = random.choice(self.weather_effects)(image)
 
-        if random.random() < APPEARANCE_AUG_PROB:
+        if random.random() < APPEARANCE_AUG_PROB * strength:
             image = random.choice(self.appearance_effects)(image)
 
-        if random.random() < CORRUPTION_AUG_PROB:
+        if random.random() < CORRUPTION_AUG_PROB * strength:
             image = random.choice(self.corruption_effects)(image)
 
-        if random.random() < OCCLUSION_AUG_PROB:
+        if random.random() < OCCLUSION_AUG_PROB * strength:
             image = self.apply_occlusion(image)
 
-        if random.random() < EXTRA_CORRUPTION_PROB:
+        if random.random() < EXTRA_CORRUPTION_PROB * strength:
             image = random.choice(self.extra_effects)(image)
 
         return image.clamp(0.0, 1.0)
@@ -503,8 +509,10 @@ class RobustnessAugmentor:
 
 
 class CityscapesJointTransform:
-    def __init__(self, training: bool):
+    def __init__(self, training: bool, epoch_ref=None, augmentation_ramp_epochs: int = AUGMENTATION_RAMP_EPOCHS):
         self.training = training
+        self.epoch_ref = epoch_ref
+        self.augmentation_ramp_epochs = augmentation_ramp_epochs
         self.robustness_augmentor = RobustnessAugmentor()
 
         self.eval_image_transform = Compose([
@@ -518,12 +526,14 @@ class CityscapesJointTransform:
             Resize(BASE_IMAGE_SIZE, interpolation=InterpolationMode.NEAREST),
             ToDtype(torch.int64),
         ])
-        self.color_jitter = v2.ColorJitter(
-            brightness=COLOR_JITTER,
-            contrast=COLOR_JITTER,
-            saturation=COLOR_JITTER,
-            hue=min(0.1, COLOR_JITTER),
-        )
+    def augmentation_strength(self) -> float:
+        if not self.training:
+            return 0.0
+        if self.epoch_ref is None or self.augmentation_ramp_epochs <= 0:
+            return 1.0
+
+        current_epoch = int(self.epoch_ref.value) + 1
+        return min(max(current_epoch / float(self.augmentation_ramp_epochs), 0.0), 1.0)
 
     def __call__(self, image, target):
         if not self.training:
@@ -565,8 +575,18 @@ class CityscapesJointTransform:
             target = TF.hflip(target)
 
         image = ToDtype(torch.float32, scale=True)(image)
-        image = self.color_jitter(image)
-        image = self.robustness_augmentor(image)
+        augmentation_strength = self.augmentation_strength()
+        if augmentation_strength > 0.0:
+            jitter_strength = COLOR_JITTER * augmentation_strength
+            hue_strength = min(0.1, COLOR_JITTER) * augmentation_strength
+            ramped_color_jitter = v2.ColorJitter(
+                brightness=jitter_strength,
+                contrast=jitter_strength,
+                saturation=jitter_strength,
+                hue=hue_strength,
+            )
+            image = ramped_color_jitter(image)
+            image = self.robustness_augmentor(image, strength=augmentation_strength)
 
         image = Normalize(CITYSCAPES_MEAN, CITYSCAPES_STD)(image)
         target = ToDtype(torch.int64)(ToImage()(target))
@@ -680,6 +700,7 @@ def main(args) -> None:
             "poly_power": POLY_POWER,
             "min_lr_ratio": MIN_LR_RATIO,
             "lovasz_loss_weight": LOVASZ_LOSS_WEIGHT,
+            "augmentation_ramp_epochs": AUGMENTATION_RAMP_EPOCHS,
             "weather_aug_prob": WEATHER_AUG_PROB,
             "appearance_aug_prob": APPEARANCE_AUG_PROB,
             "corruption_aug_prob": CORRUPTION_AUG_PROB,
@@ -705,7 +726,14 @@ def main(args) -> None:
         },
     )
 
-    train_transform = CityscapesJointTransform(training=True)
+    epoch_manager = Manager()
+    train_epoch_ref = epoch_manager.Value("i", 0)
+
+    train_transform = CityscapesJointTransform(
+        training=True,
+        epoch_ref=train_epoch_ref,
+        augmentation_ramp_epochs=AUGMENTATION_RAMP_EPOCHS,
+    )
     valid_transform = CityscapesJointTransform(training=False)
     train_dataset = CityscapesSegmentationDataset(args.data_dir, split="train", transform=train_transform)
     valid_dataset = CityscapesSegmentationDataset(args.data_dir, split="val", transform=valid_transform)
@@ -781,9 +809,14 @@ def main(args) -> None:
     print(f"Pretrained MiT loaded: {pretrained_loaded}")
     print(f"Training on {len(train_dataset)} train images.")
     print(f"Validating on {len(valid_dataset)} val images.")
+    print(
+        f"Color jitter and robustness augmentations ramp linearly over the first "
+        f"{AUGMENTATION_RAMP_EPOCHS} epochs."
+    )
 
     for epoch in range(MAX_EPOCHS):
         print(f"Epoch {epoch + 1:04}/{MAX_EPOCHS:04}")
+        train_epoch_ref.value = epoch
 
         model.train()
         train_losses = []
@@ -944,6 +977,7 @@ def main(args) -> None:
     )
     torch.save(ema_model.state_dict(), final_model_path)
     wandb.finish()
+    epoch_manager.shutdown()
 
 
 if __name__ == "__main__":
