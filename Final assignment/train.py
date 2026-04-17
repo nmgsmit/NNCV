@@ -49,9 +49,9 @@ DROPOUT = 0.1
 LOVASZ_LOSS_WEIGHT = 1.0
 WEATHER_AUG_PROB = 0.75
 APPEARANCE_AUG_PROB = 0.7
-CORRUPTION_AUG_PROB = 0.55
+CORRUPTION_AUG_PROB = 0.05
 OCCLUSION_AUG_PROB = 0.25
-EXTRA_CORRUPTION_PROB = 0.3
+EXTRA_CORRUPTION_PROB = 0.0
 
 
 id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
@@ -304,14 +304,11 @@ class RobustnessAugmentor:
             self.apply_gaussian_blur,
             self.apply_motion_blur,
             self.apply_jpeg_compression,
-            self.apply_sun_glare,
         )
         self.extra_effects = (
             self.apply_gaussian_blur,
             self.apply_motion_blur,
             self.apply_jpeg_compression,
-            self.apply_color_cast,
-            self.apply_vignette,
         )
 
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
@@ -696,7 +693,7 @@ def main(args) -> None:
             "augmentation_groups": {
                 "weather": ["fog", "rain", "snow", "low_light"],
                 "appearance": ["domain_shift", "color_cast", "shadow", "vignette"],
-                "corruptions": ["gaussian_blur", "motion_blur", "jpeg_compression", "sun_glare"],
+                "corruptions": ["gaussian_blur", "motion_blur", "jpeg_compression"],
                 "occlusion": ["cutout"],
             },
             "ema_decay": EMA_DECAY,
