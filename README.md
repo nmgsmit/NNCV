@@ -2,7 +2,7 @@
 
 This document stores the branch-by-branch explanation of the SegFormer progression and the final DDRNet efficiency branch for project administration and report planning, together with paper sources for the main improvements.
 
-! Some models are still in development and do not contribute to the final Paper
+**Some models are still in development and do not contribute to the final Paper**
 
 ## v0
 
