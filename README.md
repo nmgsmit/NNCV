@@ -4,7 +4,7 @@ This document stores the branch-by-branch explanation of the SegFormer progressi
 
 ## Some models are still in development and do not contribute to the final Paper*
 
-## v0
+## Baseline v0
 
 Branch: shared training scaffold, no separate dedicated branch.
 
