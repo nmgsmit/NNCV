@@ -1,17 +1,17 @@
 # Top Submission Details for extra points
-Email: n.m.g.smit@student.tue.nl
+**Email:** n.m.g.smit@student.tue.nl
 
-Peak Performance:
-1. NotForReport 0.5966 (not used in report)
-2. Nickv10(0,75,1) 0.5929 (SegFormer INF)
+### Peak Performance
+1. **NotForReport** - 0.5966 *(not used in report)*
+2. **Nickv10(0,75,1)** - 0.5929 *(SegFormer INF)*
 
-Robustness:
-3. NickRobustV3 0.5484 (not used in report)
-4. ModelN 0.5484 (not used in report)
-6. NickSeg_robustv2(,75_1) 0.5269 (Robust SegFormer V2)
+### Robustness
+3. **NickRobustV3** - 0.5484 *(not used in report)*
+4. **ModelN** - 0.5484 *(not used in report)*
+6. **NickSeg_robustv2(,75_1)** - 0.5269 *(Robust SegFormer V2)*
 
 Efficiency:
-11. NickDDRv3 4.6296 (not used in report)
+11. **NickDDRv3** - 4.6296 (not used in report)
 
 # SegFormer Branch Notes
 
