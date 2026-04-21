@@ -1,6 +1,23 @@
+# Top Submission Details for extra points
+Email: n.m.g.smit@student.tue.nl
+
+Peak Performance:
+1. NotForReport 0.5966 (not used in report)
+2. Nickv10(0,75,1) 0.5929 (SegFormer INF)
+
+Robustness:
+3. NickRobustV3 0.5484 (not used in report)
+4. ModelN 0.5484 (not used in report)
+6. NickSeg_robustv2(,75_1) 0.5269 (Robust SegFormer V2)
+
+Efficiency:
+11. NickDDRv3 4.6296 (not used in report)
+
 # SegFormer Branch Notes
 
 This document stores the branch-by-branch explanation of the SegFormer progression for project administration and report planning, together with paper sources for the main improvements.
+
+Run code on Snellius with: sbatch Final assignment/jobscript_slurm.sh
 
 ## Some models are still in development and do not contribute to the final Paper*
 
